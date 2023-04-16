@@ -82,6 +82,9 @@ def load_dataset(masks_path: str, images_path: str, classes_path: str = None) ->
             images_path = os.path.join(images_path, '*.png')
         y = np.asarray([io.imread(p) for p in glob(images_path)])
 
+    if y.max() != 1.0:
+        y = (y - 127.5) / 255.0
+    
     return x, y
 
 class DataIterator(keras.utils.Sequence):

@@ -28,7 +28,7 @@ from keras.layers import (
     Reshape,
     Layer
 )
-from keras.losses import BinaryCrossentropy
+from keras.losses import BinaryCrossentropy, MeanAbsoluteError
 from keras.optimizers import Adam, RMSprop
 from keras.callbacks import TensorBoard, LambdaCallback, ModelCheckpoint
 from tqdm import tqdm
@@ -69,38 +69,41 @@ class GAN_Model:
         self.d_model_patch = self._discriminator_patch_model()
         self.d_model_global = self._discriminator_global_model()
 
+        d_loss = BinaryCrossentropy(from_logits=True)
+        g_loss = MeanAbsoluteError()
+
         # Generator won't be trained directly
         # Just compile it
         self.g_model.compile()
-
         self.d_model_patch.compile(
-            optimizer=Adam(d_p_lr, beta_1=0.5),
-            loss=["binary_crossentropy"],
-            metrics=["accuracy"],
+            optimizer=Adam(d_g_lr, beta_1=0.5),
+            loss=d_loss,
+            metrics=["accuracy"]
         )
         self.d_model_global.compile(
             optimizer=Adam(d_g_lr, beta_1=0.5),
-            loss=["binary_crossentropy"],
-            metrics=["accuracy"],
+            loss=d_loss,
+            metrics=["accuracy"]
         )
 
         # Disable a discriminator training during gan training
         self.d_model_patch.trainable = False
         self.d_model_global.trainable = False
 
+        # Define GAN model
         self.gan = self._gan_model()
         self.gan.compile(
             optimizer=Adam(gan_lr, beta_1=0.5),
-            loss=["binary_crossentropy", "binary_crossentropy", "mae"],
+            loss=[d_loss, d_loss, g_loss],
             loss_weights=gan_loss_weights
         )
 
     def _gan_model(self):
-        H = h = Input(self.input_size, name="mask")
-        generator_out = self.g_model(h)
-        discriminator_patch_out = self.d_model_patch([h, generator_out])
-        discriminator_global_out = self.d_model_global([h, generator_out])
-        return Model(inputs=H, outputs=[discriminator_patch_out, discriminator_global_out, generator_out], name="GAN")
+        x = Input(self.input_size, name="mask")
+        g_out = self.g_model(x)
+        d_patch_out = self.d_model_patch([x, g_out])
+        d_global_out = self.d_model_global([x, g_out])
+        return Model(inputs=x, outputs=[d_patch_out, d_global_out, g_out], name="GAN")
 
     def _discriminator_patch_model(self):
         h = Input(self.input_size, name="mask")
@@ -112,17 +115,16 @@ class GAN_Model:
         x = LeakyReLU(0.3)(x)
 
         x = MaxPooling2D((2, 2))(x)
-        x = Dropout(0.25)(x)
-        x = Conv2D(128, kernels, padding="valid", use_bias=False)(x)
+        x = Dropout(0.5)(x)
+        x = Conv2D(128, kernels, padding="same", use_bias=False)(x)
         x = LeakyReLU(0.3)(BatchNormalization()(x))
 
         x = MaxPooling2D((2, 2))(x)
-        x = Dropout(0.25)(x)
-        x = Conv2D(256, kernels, padding="valid", use_bias=False)(x)
+        x = Dropout(0.5)(x)
+        x = Conv2D(256, kernels, padding="same", use_bias=False)(x)
         x = LeakyReLU(0.3)(BatchNormalization()(x))
 
-        x = Conv2D(1, kernels, padding="valid",
-                   activation="sigmoid", use_bias=False)(x)
+        x = Conv2D(1, kernels, padding="same", use_bias=False)(x)
         return Model(inputs=[h, t], outputs=x, name="discriminator_patch")
 
     def _discriminator_global_model(self):
@@ -135,34 +137,35 @@ class GAN_Model:
         x = LeakyReLU(0.3)(x)
 
         x = MaxPooling2D((2, 2))(x)
-        x = Dropout(0.25)(x)
-        x = Conv2D(128, kernels, padding="valid", use_bias=False)(x)
+        x = Dropout(0.5)(x)
+        x = Conv2D(128, kernels, padding="same", use_bias=False)(x)
         x = LeakyReLU(0.3)(BatchNormalization()(x))
 
         x = MaxPooling2D((2, 2))(x)
-        x = Dropout(0.25)(x)
-        x = Conv2D(256, kernels, padding="valid", use_bias=False)(x)
+        x = Dropout(0.5)(x)
+        x = Conv2D(256, kernels, padding="same", use_bias=False)(x)
         x = LeakyReLU(0.3)(BatchNormalization()(x))
+
         x = Flatten()(x)
-        x = Dense(1, activation="sigmoid", use_bias=False)(x)
+        x = Dense(128, use_bias=False)(x)
+        x = Dense(1, use_bias=False)(x)
         return Model(inputs=[h, t], outputs=x, name="discriminator_global")
 
     def _generator_model(self):
         H = h = Input(self.input_size, name="mask")
         z = Noise((256,))(h)
-
-
-        x = h # Concatenate()([h, z])
+        x = h  # Concatenate()([h, z])
 
         encoder = []
-        kernels = 3
+        kernels = 4
         filters, fn, fm = np.array([32, 64, 128, 192]), 256, 32
         for f in filters:
             x = Conv2D(f, kernels, padding="same", activation="relu")(x)
             encoder.append(x)
             x = Conv2D(f, kernels, strides=2, padding="same")(x)
-            n = Dense(np.prod(x.shape[1:3]) * f // 4)(z)
-            n = Reshape((*x.shape[1:3], f // 4))(n)
+
+            n = Dense(np.prod(x.shape[1:3]) * f // 8)(z)
+            n = Reshape((*x.shape[1:3], f // 8))(n)
             x = Concatenate()([x, n])
 
         x = Conv2D(fn, kernels, padding="same", activation="relu")(x)
@@ -172,7 +175,7 @@ class GAN_Model:
             x = Conv2D(f, kernels, padding="same", activation='relu')(x)
             x = Concatenate()([encoder.pop(), x])
 
-        x = GaussianDropout(0.15)(x)
+        x = GaussianDropout(0.1)(x)
         x = Conv2D(fm, kernels, padding="same", activation="relu")(x)
         outputs = Conv2D(self.output_size[-1], 3, padding="same",
                          activation="tanh", name="output")(x)
@@ -198,7 +201,8 @@ class GAN_Training(GAN_Model):
         log_path: str = "tf_logs",
         model_code_save: str = 'code',
         save_with_optimizer: bool = False,
-        logging: bool = True
+        logging: bool = True,
+        evaluate_per_step: int = None
     ):
         super().__init__(input_size, output_size, d_p_lr, d_g_lr, gan_lr, gan_loss_weights)
 
@@ -211,6 +215,7 @@ class GAN_Training(GAN_Model):
         self.model_code_save = model_code_save
         self.save_with_optimizer = save_with_optimizer
         self.logging = logging
+        self.evaluate_per_step = evaluate_per_step
 
         self._create_dirs()
         if self.logging:
@@ -227,11 +232,18 @@ class GAN_Training(GAN_Model):
             file.write(d)
 
     def _evaluate(
-        self, epoch: int, data: Tuple[np.ndarray, np.ndarray] = None
+        self,
+        epoch: int,
+        data: Tuple[np.ndarray, np.ndarray] = None,
+        step: int = None
     ) -> Union[None, Tuple[np.ndarray]]:
         if data is not None:
             images = []
-            path = os.path.join(self.evaluate_path_save, str(epoch))
+            if step is not None:
+                path = os.path.join(self.evaluate_path_save, f'{epoch}_{step}')
+            else:
+                path = os.path.join(self.evaluate_path_save, str(epoch))
+
             Path(path).mkdir(parents=True, exist_ok=True)
 
             xdata, ydata = data
@@ -240,6 +252,8 @@ class GAN_Training(GAN_Model):
             for i in range(len(xdata)):
                 x, y = xdata[i], ydata[i]
                 impath = os.path.join(path, f"org_{i}.png")
+                x = np.argmax(x, axis=-1, keepdims=True)
+                x = np.concatenate([x, x, x], axis=-1)
                 image = np.array(
                     np.concatenate([x, pred[i], (y + 1) / 2.0],
                                    axis=1) * 255, "uint8"
@@ -348,23 +362,24 @@ class GAN_Training(GAN_Model):
             _, _,
             labels_join_patch, labels_join_global
         ) = self._prepare_discriminator_labels(batch_size)
-        
+
         # Init iterator
         data_it = DataIterator(dataset, batch_size)
         steps = len(data_it)
         assert steps > log_per_steps
-        
+        step_number = 0
+
         for epoch in range(epochs):
             print(f'Epoch: {epoch + 1}/{epochs}')
             mdp, mdg, mg = [], [], []
             # Training discriminator loop
             for step, (gts, images_real), in enumerate(tqdm(data_it)):
                 # Concatenate fake with true
-                image_fake = self.g_model.predict_on_batch(gts)
-
-                # Train discriminators on predicted and real and fake data
+                image_fake = self.g_model(gts)
                 gts_join = tf.concat([gts, gts], axis=0)
                 images_join = tf.concat([images_real, image_fake], axis=0)
+
+                # Train discriminators on predicted and real and fake data
                 metrics_d_patch = self.d_model_patch.train_on_batch(
                     [gts_join, images_join], labels_join_patch
                 )
@@ -381,6 +396,12 @@ class GAN_Training(GAN_Model):
                 mdg.append(metrics_d_global)
                 mg.append(metrics_gan)
 
+                # Save evaluation
+                if self.evaluate_per_step is not None and step_number % self.evaluate_per_step == 0:
+                    images = self._evaluate(epoch, data_it[0], step_number)
+                    self._write_images(epoch, images)
+                step_number += 1
+
                 # Store generator and discriminator metrics
                 if step % log_per_steps == log_per_steps - 1:
                     tf.summary.experimental.set_step(epoch * steps + step)
@@ -390,13 +411,14 @@ class GAN_Training(GAN_Model):
                     self._write_log(
                         self.d_model_global.metrics_names, metrics_d_global)
 
-
             # Call on epoch end on the dataset
             data_it.on_epoch_end()
-            
-            if (epoch + 1) % save_per_epochs == 0:
-                images = self._evaluate(epoch=epoch, data=data_it[0][0])
+
+            if self.evaluate_per_step is None:
+                images = self._evaluate(epoch, data_it[0])
                 self._write_images(epoch, images)
+
+            if (epoch + 1) % save_per_epochs == 0:
                 self._save_models(f"model_{epoch}.h5", f"model_{epoch}.h5")
 
             print('Discriminator patch: ', np.mean(
