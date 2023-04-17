@@ -13,8 +13,8 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 
 if __name__ == '__main__':
-    dataset = load_dataset('data/ADE20K/24_classes.npy',
-                           'data/ADE20K/images.npy')
+    # dataset = load_dataset('data/ADE20K/24_classes.npy', 'data/ADE20K/images.npy')
+    dataset = load_dataset('data/lhq_256/24_classes.npy', 'data/lhq_256/images.npy')
 
     args = {
         'input_size': (256, 256, 25),
@@ -23,16 +23,17 @@ if __name__ == '__main__':
         'gan_lr':  1e-4,
         'gan_loss_weights': [1, 1, 10],
         'main_log_path': "logs",
-        'g_path_save': None,  # "generators",
+        'g_path_save': "generators",
         'd_path_save': None,  # "discriminators",
         'evaluate_path_save': "images",
-        'log_path':  "tf_logs",
         'model_code_save': 'code',
         'save_with_optimizer': False,
         'logging': True,
-        'evaluate_per_step': 100
+        'evaluate_per_step': 300
     }
 
+        
+    print(dataset[0].dtype, dataset[1].dtype, dataset[1].max(), dataset[1].min())
+
     gan = GAN_Training(**args)
-    gan.train(50, dataset, save_per_epochs=1, batch_size=8)
-    os.system('shutdown /s /t 30')
+    gan.train(10, dataset, save_per_epochs=1, batch_size=10)

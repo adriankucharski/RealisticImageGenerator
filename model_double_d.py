@@ -5,7 +5,7 @@ Double Discriminator GAN architecture
 import datetime
 import os
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, NamedTuple, Tuple, Union
 import inspect
 import numpy as np
 import tensorflow as tf
@@ -39,6 +39,15 @@ import pytictoc
 tic_timer = pytictoc.TicToc()
 np.set_printoptions(suppress=True)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+
+class GAN_Model_Params(NamedTuple):
+    input_size: Tuple[int, int, int] = (256, 256, 25)
+    output_size: Tuple[int, int, int] = (256, 256, 3)
+    d_p_lr: int = 1e-5
+    d_g_lr: int = 1e-5
+    gan_lr: int = 1e-5
+    gan_loss_weights: Tuple[float, float, float] = [1, 1, 100]
 
 
 class Noise(Layer):
@@ -76,7 +85,7 @@ class GAN_Model:
         # Just compile it
         self.g_model.compile()
         self.d_model_patch.compile(
-            optimizer=Adam(d_g_lr, beta_1=0.5),
+            optimizer=Adam(d_p_lr, beta_1=0.5),
             loss=d_loss,
             metrics=["accuracy"]
         )
@@ -147,7 +156,7 @@ class GAN_Model:
         x = LeakyReLU(0.3)(BatchNormalization()(x))
 
         x = Flatten()(x)
-        x = Dense(128, use_bias=False)(x)
+        x = Dense(128, activation='relu', use_bias=False)(x)
         x = Dense(1, use_bias=False)(x)
         return Model(inputs=[h, t], outputs=x, name="discriminator_global")
 
@@ -158,27 +167,30 @@ class GAN_Model:
 
         encoder = []
         kernels = 4
+        noise_channels = 2
         filters, fn, fm = np.array([32, 64, 128, 192]), 256, 32
         for f in filters:
             x = Conv2D(f, kernels, padding="same", activation="relu")(x)
             encoder.append(x)
-            x = Conv2D(f, kernels, strides=2, padding="same")(x)
+            x = Conv2D(f, kernels, strides=2, padding="same",
+                       activation=LeakyReLU(0.1))(x)
 
-            n = Dense(np.prod(x.shape[1:3]) * f // 8)(z)
-            n = Reshape((*x.shape[1:3], f // 8))(n)
+            n = Dense(np.prod(x.shape[1:3]) * noise_channels)(z)
+            n = Reshape((*x.shape[1:3], noise_channels))(n)
             x = Concatenate()([x, n])
 
         x = Conv2D(fn, kernels, padding="same", activation="relu")(x)
 
         for f in filters[::-1]:
-            x = Conv2DTranspose(f, kernels, strides=2, padding='same')(x)
+            x = Conv2DTranspose(f, kernels, strides=2,
+                                padding='same', activation=LeakyReLU(0.1))(x)
             x = Conv2D(f, kernels, padding="same", activation='relu')(x)
             x = Concatenate()([encoder.pop(), x])
 
         x = GaussianDropout(0.1)(x)
         x = Conv2D(fm, kernels, padding="same", activation="relu")(x)
-        outputs = Conv2D(self.output_size[-1], 3, padding="same",
-                         activation="tanh", name="output")(x)
+        outputs = Conv2D(
+            self.output_size[-1], 3, padding="same", activation="tanh", name="output")(x)
         return Model(inputs=H, outputs=outputs, name="generator")
 
 
@@ -188,27 +200,26 @@ class GAN_Training(GAN_Model):
         # GAN Model args
         input_size=(256, 256, 25),
         output_size=(256, 256, 3),
-        d_p_lr=1e-5,
-        d_g_lr=1e-5,
-        gan_lr=1e-5,
-        gan_loss_weights: Tuple[float, float, float] = [1, 1, 100],
+        d_p_lr=4e-4,
+        d_g_lr=4e-4,
+        gan_lr=1e-4,
+        gan_loss_weights: Tuple[float, float, float] = [1, 1, 10],
 
         # GAN_Training args
         main_log_path: str = "logs",
         g_path_save: str = "generators",
         d_path_save: str = "discriminators",
         evaluate_path_save: str = "images",
-        log_path: str = "tf_logs",
         model_code_save: str = 'code',
         save_with_optimizer: bool = False,
         logging: bool = True,
         evaluate_per_step: int = None
     ):
         super().__init__(input_size, output_size, d_p_lr, d_g_lr, gan_lr, gan_loss_weights)
+        self.args_to_save = inspect.getargvalues(inspect.currentframe())
 
         timer = datetime.datetime.now().strftime("%Y%m%d-%H%M")
         self.main_log_path = os.path.join(main_log_path, timer)
-        self.log_path = log_path
         self.g_path_save = g_path_save
         self.d_path_save = d_path_save
         self.evaluate_path_save = evaluate_path_save
@@ -219,17 +230,18 @@ class GAN_Training(GAN_Model):
 
         self._create_dirs()
         if self.logging:
-            self.writer = tf.summary.create_file_writer(
-                os.path.join(self.main_log_path, self.log_path))
+            self.writer = tf.summary.create_file_writer(self.main_log_path)
             self._log_code()
 
     def _log_code(self):
-        g = inspect.getsource(self._generator_model)
-        d = inspect.getsource(self._discriminator_patch_model)
+        gt = inspect.getsource(GAN_Training)
+        gm = inspect.getsource(GAN_Model)
         with open(os.path.join(self.model_code_save, 'gan.txt'), 'w') as file:
-            file.write(g)
+            file.write(gt)
             file.write('\n')
-            file.write(d)
+            file.write(gm)
+            file.write('\n')
+            file.write(str(self.args_to_save))
 
     def _evaluate(
         self,
@@ -302,8 +314,6 @@ class GAN_Training(GAN_Model):
 
     def _create_dirs(self):
         if self.logging:
-            if self.log_path:
-                self.log_path = os.path.join(self.main_log_path, self.log_path)
             if self.g_path_save:
                 self.g_path_save = os.path.join(
                     self.main_log_path, self.g_path_save)
@@ -318,7 +328,6 @@ class GAN_Training(GAN_Model):
                     self.main_log_path, self.evaluate_path_save)
 
             for path in [
-                self.log_path,
                 self.g_path_save,
                 self.d_path_save,
                 self.evaluate_path_save,
@@ -405,11 +414,14 @@ class GAN_Training(GAN_Model):
                 # Store generator and discriminator metrics
                 if step % log_per_steps == log_per_steps - 1:
                     tf.summary.experimental.set_step(epoch * steps + step)
-                    self._write_log(self.gan.metrics_names, metrics_gan)
-                    self._write_log(
-                        self.d_model_patch.metrics_names, metrics_d_patch)
-                    self._write_log(
-                        self.d_model_global.metrics_names, metrics_d_global)
+                    gan_mn = [m + '_gan' for m in self.gan.metrics_names]
+                    dp_mn = [
+                        m + '_d_patch' for m in self.d_model_patch.metrics_names]
+                    dg_mn = [
+                        m + '_d_global' for m in self.d_model_global.metrics_names]
+                    self._write_log(gan_mn, metrics_gan)
+                    self._write_log(dp_mn, metrics_d_patch)
+                    self._write_log(dg_mn, metrics_d_global)
 
             # Call on epoch end on the dataset
             data_it.on_epoch_end()
