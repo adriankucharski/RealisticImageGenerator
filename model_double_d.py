@@ -41,14 +41,6 @@ np.set_printoptions(suppress=True)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 
-class GAN_Model_Params(NamedTuple):
-    input_size: Tuple[int, int, int] = (256, 256, 25)
-    output_size: Tuple[int, int, int] = (256, 256, 3)
-    d_p_lr: int = 1e-5
-    d_g_lr: int = 1e-5
-    gan_lr: int = 1e-5
-    gan_loss_weights: Tuple[float, float, float] = [1, 1, 100]
-
 
 class Noise(Layer):
     def __init__(self, size: List[int]):
@@ -77,6 +69,7 @@ class GAN_Model:
         self.g_model = self._generator_model()
         self.d_model_patch = self._discriminator_patch_model()
         self.d_model_global = self._discriminator_global_model()
+        self.gan_loss_weights = K.variable(gan_loss_weights)
 
         d_loss = BinaryCrossentropy(from_logits=True)
         g_loss = MeanAbsoluteError()
@@ -104,7 +97,7 @@ class GAN_Model:
         self.gan.compile(
             optimizer=Adam(gan_lr, beta_1=0.5),
             loss=[d_loss, d_loss, g_loss],
-            loss_weights=gan_loss_weights
+            loss_weights=self.gan_loss_weights
         )
 
     def _gan_model(self):
@@ -167,18 +160,20 @@ class GAN_Model:
 
         encoder = []
         kernels = 4
-        noise_channels = 2
-        filters, fn, fm = np.array([32, 64, 128, 192]), 256, 32
+        noise_channels = 1
+        filters, fn, fm = np.array([32, 64, 128, 256]), 256, 32
         for f in filters:
             x = Conv2D(f, kernels, padding="same", activation="relu")(x)
             encoder.append(x)
             x = Conv2D(f, kernels, strides=2, padding="same",
                        activation=LeakyReLU(0.1))(x)
 
-            n = Dense(np.prod(x.shape[1:3]) * noise_channels)(z)
+            n = Dense(np.prod(x.shape[1:3]) * noise_channels,
+                      activation=LeakyReLU(0.1))(z)
             n = Reshape((*x.shape[1:3], noise_channels))(n)
             x = Concatenate()([x, n])
 
+        x = Conv2D(fn, kernels, padding="same", activation="relu")(x)
         x = Conv2D(fn, kernels, padding="same", activation="relu")(x)
 
         for f in filters[::-1]:
@@ -193,6 +188,8 @@ class GAN_Model:
             self.output_size[-1], 3, padding="same", activation="tanh", name="output")(x)
         return Model(inputs=H, outputs=outputs, name="generator")
 
+    def set_loss_weights(self, new_value: Tuple[float, float, float]):
+        K.set_value(self.gan_loss_weights, new_value)
 
 class GAN_Training(GAN_Model):
     def __init__(
@@ -213,7 +210,7 @@ class GAN_Training(GAN_Model):
         model_code_save: str = 'code',
         save_with_optimizer: bool = False,
         logging: bool = True,
-        evaluate_per_step: int = None
+        evaluate_per_step: int = None,
     ):
         super().__init__(input_size, output_size, d_p_lr, d_g_lr, gan_lr, gan_loss_weights)
         self.args_to_save = inspect.getargvalues(inspect.currentframe())
@@ -364,6 +361,7 @@ class GAN_Training(GAN_Model):
         batch_size=16,
         save_per_epochs=5,
         log_per_steps=5,
+        categorical_input: bool = True
     ):
         # Prepare label arrays for D and GAN training
         (
@@ -373,7 +371,8 @@ class GAN_Training(GAN_Model):
         ) = self._prepare_discriminator_labels(batch_size)
 
         # Init iterator
-        data_it = DataIterator(dataset, batch_size)
+        data_it = DataIterator(dataset, batch_size,
+                               as_categorical=categorical_input)
         steps = len(data_it)
         assert steps > log_per_steps
         step_number = 0
@@ -400,6 +399,10 @@ class GAN_Training(GAN_Model):
                 metrics_gan = self.gan.train_on_batch(
                     gts, [real_labels_patch, real_labels_global, images_real])
 
+                # Calculate MAE loss weight:
+                mae_weight = metrics_gan[-1] / max(metrics_d_global[0] + metrics_d_patch[0], 1)
+                self.set_loss_weights([1, 1, mae_weight])
+
                 # Store metrics in array
                 mdp.append(metrics_d_patch)
                 mdg.append(metrics_d_global)
@@ -408,7 +411,6 @@ class GAN_Training(GAN_Model):
                 # Save evaluation
                 if self.evaluate_per_step is not None and step_number % self.evaluate_per_step == 0:
                     images = self._evaluate(epoch, data_it[0], step_number)
-                    self._write_images(epoch, images)
                 step_number += 1
 
                 # Store generator and discriminator metrics

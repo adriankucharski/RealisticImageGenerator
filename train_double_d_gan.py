@@ -29,11 +29,11 @@ if __name__ == '__main__':
         'model_code_save': 'code',
         'save_with_optimizer': False,
         'logging': True,
-        'evaluate_per_step': 300
+        'evaluate_per_step': 300,
     }
 
         
     print(dataset[0].dtype, dataset[1].dtype, dataset[1].max(), dataset[1].min())
 
     gan = GAN_Training(**args)
-    gan.train(10, dataset, save_per_epochs=1, batch_size=10)
+    gan.train(10, dataset, save_per_epochs=1, batch_size=10, categorical_input=True)

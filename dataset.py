@@ -14,13 +14,16 @@ import matplotlib.pyplot as plt
 from transformers import SegformerFeatureExtractor, SegformerForSemanticSegmentation
 import requests
 
+
 def image_to_mask(images, model, feature_extractor) -> List[np.ndarray]:
     inputs = feature_extractor(images=images, return_tensors="pt")
     outputs = model(**inputs)
     logits = outputs.logits
-    data: np.ndarray = np.array(logits.detach().numpy()).transpose((0, 2, 3, 1))
+    data: np.ndarray = np.array(
+        logits.detach().numpy()).transpose((0, 2, 3, 1))
     image_mask = np.argmax(data, axis=-1, keepdims=True)
     return image_mask.astype(np.uint8)
+
 
 def parse_csv(path: str = 'data/included_classes.csv', sep: str = ';'):
     csv = pd.read_csv(path, sep=sep)
@@ -30,10 +33,13 @@ def parse_csv(path: str = 'data/included_classes.csv', sep: str = ';'):
             classes[name] = index
     return classes
 
-def processing_images(paths: List[str], classes: dict, cval_add: int = 0) -> List[np.ndarray]:
+
+def processing_images(paths: List[str], classes: dict, cval_add: int = 0, image_size: Tuple[int, int] = None) -> List[np.ndarray]:
     images = []
     for p in paths:
         im = io.imread(p)
+        if image_size is not None:
+            im = transform.resize(im, image_size, preserve_range=True)
         if len(im.shape) == 3:
             im = im[..., 0:1]
         else:
@@ -44,12 +50,14 @@ def processing_images(paths: List[str], classes: dict, cval_add: int = 0) -> Lis
         images.append(x)
     return images
 
+
 def transform_masks(classes_path: str = 'data/lhq_256/included_classes.csv',
-                      masks_path: str = 'data/lhq_256/annotations/',
-                      batch_size: int = 64,
-                      cval_add: int = 0,
-                      cpu_limit: int = None
-                      ) -> np.ndarray:
+                    masks_path: str = 'data/lhq_256/annotations/',
+                    batch_size: int = 64,
+                    cval_add: int = 0,
+                    cpu_limit: int = None,
+                    image_size: Tuple[int, int] = None
+                    ) -> np.ndarray:
 
     classes = parse_csv(classes_path)
     if not masks_path.endswith('*.png'):
@@ -62,6 +70,7 @@ def transform_masks(classes_path: str = 'data/lhq_256/included_classes.csv',
         files_batched,
         itertools.repeat(classes),
         itertools.repeat(cval_add),
+        itertools.repeat(image_size),
     )
     if cpu_limit is None:
         cpu_limit = multiprocessing.cpu_count()
@@ -76,21 +85,23 @@ def transform_masks(classes_path: str = 'data/lhq_256/included_classes.csv',
                 _data.extend(d)
             return _data
 
+
 def load_dataset(masks_path: str, images_path: str, classes_path: str = None) -> Tuple[np.ndarray, np.ndarray]:
     if os.path.isfile(masks_path) and masks_path.endswith('.npy'):
         x = np.load(masks_path)
     else:
         assert classes_path is not None
         x = transform_masks(classes_path, masks_path)
-        
+
     if os.path.isfile(images_path) and images_path.endswith('.npy'):
         y = np.load(images_path)
     else:
         if not images_path.endswith('*.png'):
             images_path = os.path.join(images_path, '*.png')
         y = np.asarray([io.imread(p) for p in glob(images_path)])
-    
+
     return x, y
+
 
 class DataIterator(keras.utils.Sequence):
     def __init__(
@@ -117,10 +128,13 @@ class DataIterator(keras.utils.Sequence):
         # Generate indexes of the batch
         idx = np.s_[index * self.batch_size: (index + 1) * self.batch_size]
         x = self.segmentation_mask[idx]
-        y = self.real_image[idx]
+        y = (self.real_image[idx] - 127.5) / 127.5
         if self.as_categorical:
             x = to_categorical(x, self.classes)
-        return x, (y - 127.5) / 127.5
+        else:
+            x = x / (self.classes - 1.0)
+
+        return x, y
 
     def on_epoch_end(self):
         if self.shuffle:
@@ -134,6 +148,11 @@ class DataIterator(keras.utils.Sequence):
     def get_number_of_classes(self):
         return self.classes
 
+
+def load_and_resize(path: str, size: Tuple[int, int]) -> np.ndarray:
+    im = io.imread(path)
+    im = transform.resize(im, size, preserve_range=True).astype(np.uint8)
+    return im
 
 
 if __name__ == '__main__':
@@ -153,45 +172,69 @@ if __name__ == '__main__':
                 im = color.gray2rgb(im)
             im = transform.resize(im, (256, 256), preserve_range=True)
             io.imsave(r, im.astype(np.uint8), check_contrast=False)
-            
-    if True:
+
+    if False:
         data = transform_masks(
-            classes_path = 'data/included_classes.csv',
-            masks_path = 'data/lhq_256/annotations',
-            batch_size = 128
+            classes_path='data/included_classes.csv',
+            masks_path='data/lhq_256/annotations',
+            batch_size=128
         )
         np.save('data/lhq_256/24_classes.npy', data.astype(np.uint8))
+        
+    if False:
+        data = transform_masks(
+            classes_path='data/included_classes.csv',
+            masks_path='data/lhq_256/annotations',
+            batch_size=128,
+            image_size=(128, 128)
+        )
+        np.save('data/lhq_256/24_classes_128.npy', data.astype(np.uint8))
 
     if False:
         data = transform_masks(
-            classes_path = 'data/included_classes.csv',
-            masks_path = 'data/ADE20K/annotations_256',
-            batch_size = 128,
-            cval_add = 1
+            classes_path='data/included_classes.csv',
+            masks_path='data/ADE20K/annotations_256',
+            batch_size=128,
+            cval_add=1
         )
         np.save('data/ADE20K/24_classes.npy', data.astype(np.uint8))
-        
 
     if False:
-        images = np.asarray([np.array(io.imread(p), dtype=np.uint8) for p in glob('data/ADE20K/images_256/*.png')])
+        images = np.asarray([np.array(io.imread(p), dtype=np.uint8)
+                            for p in glob('data/ADE20K/images_256/*.png')])
         np.save('data/ADE20K/images.npy', images)
 
     if False:
-        images = np.asarray([np.array(io.imread(p), dtype=np.uint8) for p in glob('data/lhq_256/images/*.png')])
+        images = np.asarray([np.array(io.imread(p), dtype=np.uint8)
+                            for p in glob('data/lhq_256/images/*.png')])
         np.save('data/lhq_256/images.npy', images)
         
+    if False:
+        with multiprocessing.Pool(12) as pool:
+            paths = glob('data/lhq_256/images/*.png')
+            args = zip(
+                paths,
+                itertools.repeat([128, 128])
+            )
+            images = pool.starmap(load_and_resize, tqdm(args, total=len(paths)))
+            images = np.concatenate(images, axis=0)
+        np.save('data/lhq_256/images_128.npy', images)
 
     if False:
-        feature_extractor = SegformerFeatureExtractor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
-        model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
-        dataset = load_dataset('data/lhq_256/24_classes.npy', 'data/lhq_256/images.npy')
+        feature_extractor = SegformerFeatureExtractor.from_pretrained(
+            "nvidia/segformer-b0-finetuned-ade-512-512")
+        model = SegformerForSemanticSegmentation.from_pretrained(
+            "nvidia/segformer-b0-finetuned-ade-512-512")
+        dataset = load_dataset(
+            'data/lhq_256/24_classes.npy', 'data/lhq_256/images.npy')
 
         images = dataset[1][:10]
         masks128x128 = image_to_mask(images, model, feature_extractor)
 
         masks = []
         for k in range(len(masks128x128)):
-            mask = transform.resize(masks128x128[k], images[k].shape, preserve_range=True).astype(np.uint8)
+            mask = transform.resize(
+                masks128x128[k], images[k].shape, preserve_range=True).astype(np.uint8)
             masks.append(mask)
 
         print(parse_csv())
@@ -202,4 +245,3 @@ if __name__ == '__main__':
             plt.show()
             plt.imshow(dataset[1][i])
             plt.show()
-            
