@@ -15,6 +15,7 @@ from skimage import transform, color
 import functools
 import operator
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 def parse_csv(path: str = 'data/ADE20K/included_classes.csv', sep: str = ';'):
     csv = pd.read_csv(path, sep=sep)
@@ -87,19 +88,32 @@ def load_dataset(masks_path: str, images_path: str, classes_path: str = None) ->
     
     return x, y
 
+def generate_segmentation_maps(labels):
+    colors = list(sns.color_palette(None, np.unique(labels).size))
+    h, w = labels[0].shape[0], labels[0].shape[1]
+    choices = [
+        np.stack([np.ones((h, w))*color[0], np.ones((h, w))*color[1], np.ones((h, w))*color[2]])
+        for color in colors
+    ]
+    choices = np.transpose(choices, [0, 2, 3, 1])
+    
+    labels_aux = np.repeat(labels, repeats=3, axis=-1)
+    # print(np.max(labels_aux), np.min(labels_aux))
+    # print(labels_aux.shape, len(choices), choices[0].shape)
+    segmentation_map = np.choose(labels_aux, choices)
+    return segmentation_map
+
 class DataIterator(keras.utils.Sequence):
     def __init__(
         self,
-        dataset: Tuple[np.ndarray, np.ndarray],
+        dataset: Tuple[np.ndarray, np.ndarray, np.ndarray],
         batch_size=32,
-        as_categorical: bool = True,
         shuffle: bool = True
     ):
         self.dataset = dataset
         self.batch_size = batch_size
-        self.segmentation_mask, self.real_image = dataset
-        self.classes = self.segmentation_mask.max() + 1
-        self.as_categorical = as_categorical
+        self.real_image, self.segmap, self.label= dataset
+        self.classes = self.label.max() + 1
         self.shuffle = shuffle
         self.on_epoch_end()
 
@@ -109,26 +123,25 @@ class DataIterator(keras.utils.Sequence):
 
     def __getitem__(self, index: int) -> Tuple[np.ndarray, np.ndarray]:
         "Generate one batch of data and returns: (mask, image)"
-        # Generate indexes of the batch
         idx = np.s_[index * self.batch_size: (index + 1) * self.batch_size]
-        x = self.segmentation_mask[idx]
-        y = self.real_image[idx]
-        if self.as_categorical:
-            x = to_categorical(x, self.classes)
-        return x, y
+        image = self.real_image[idx]
+        segmap = self.segmap[idx]
+        label = to_categorical(self.label[idx], self.classes)
+        return image, segmap, label
 
     def on_epoch_end(self):
         if self.shuffle:
             seed = np.random.randint(100000)
             np.random.seed(seed)
-            np.random.shuffle(self.segmentation_mask)
+            np.random.shuffle(self.label)
             np.random.seed(seed)
             np.random.shuffle(self.real_image)
+            np.random.seed(seed)
+            np.random.shuffle(self.segmap)
             np.random.seed(None)
 
     def get_number_of_classes(self):
         return self.classes
-
 
 
 if __name__ == '__main__':
@@ -138,7 +151,7 @@ if __name__ == '__main__':
             Path(p).parent.mkdir(parents=True, exist_ok=True)
             mim = io.imread(path)
             mim = transform.resize(mim, (256, 256), preserve_range=True)
-            # io.imsave(p, mim.astype(np.uint8), check_contrast=False)
+            io.imsave(p, mim.astype(np.uint8), check_contrast=False)
 
             q = path.replace('annotations', 'images')
             r = path.replace('annotations', 'images_256')
@@ -155,7 +168,7 @@ if __name__ == '__main__':
             masks_path='data/lhq_256/annotations',
             batch_size=128
         )
-        np.save('data/lhq_256/24_classes.npy', data.astype(np.uint8))
+        np.save('data/lhq_256/24_classes.npy', np.array(data).astype(np.uint8))
 
     if False:
         data = transform_masks(
@@ -163,12 +176,18 @@ if __name__ == '__main__':
             masks_path='data/ADE20K/annotations_256',
             batch_size=128
         )
-        np.save('data/ADE20K/24_classes.npy', data.astype(np.uint8))
+        np.save('data/ADE20K/24_classes.npy', np.array(data).astype(np.uint8))
         
 
-    if True:
+    if False:
         images = np.asarray([io.imread(p) for p in glob('data/ADE20K/images_256/*.png')])
         np.save('data/ADE20K/images.npy', images)
+        
+    if True:
+        labels = np.load('data/ADE20K/24_classes.npy')
+        segmentation_maps = generate_segmentation_maps(labels)
+        print(segmentation_maps.shape)
+        np.save('data/ADE20K/segmaps.npy', segmentation_maps)
         
         
     # np.save('data/lhq_256/24_classes.npy', data)
