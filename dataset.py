@@ -13,7 +13,11 @@ from skimage import transform, color, io
 import matplotlib.pyplot as plt
 from transformers import SegformerFeatureExtractor, SegformerForSemanticSegmentation
 import requests
+import cv2
 
+def generate_colors(num_of_colors: int, seed: int = 0) -> np.ndarray:
+    colors = np.random.Generator(np.random.PCG64(seed)).integers(32, 255, size=(num_of_colors, 3))
+    return colors.astype(np.uint8)
 
 def image_to_mask(images, model, feature_extractor) -> List[np.ndarray]:
     inputs = feature_extractor(images=images, return_tensors="pt")
@@ -109,7 +113,9 @@ class DataIterator(keras.utils.Sequence):
         dataset: Tuple[np.ndarray, np.ndarray],
         batch_size=32,
         as_categorical: bool = True,
-        shuffle: bool = True
+        shuffle: bool = True,
+        random_rot90: bool = True,
+        mirroring: bool = True
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -117,6 +123,8 @@ class DataIterator(keras.utils.Sequence):
         self.classes = self.segmentation_mask.max() + 1
         self.as_categorical = as_categorical
         self.shuffle = shuffle
+        self.random_rot90 = random_rot90
+        self.mirroring = mirroring
         self.on_epoch_end()
 
     def __len__(self) -> int:
@@ -132,7 +140,7 @@ class DataIterator(keras.utils.Sequence):
         if self.as_categorical:
             x = to_categorical(x, self.classes)
         else:
-            x = x / (self.classes - 1.0)
+            x = (x / 127.5) - 1
 
         return x, y
 
@@ -144,14 +152,22 @@ class DataIterator(keras.utils.Sequence):
             np.random.seed(seed)
             np.random.shuffle(self.real_image)
             np.random.seed(None)
-
+        if self.random_rot90:
+            for i in range(0, len(self.segmentation_mask), self.batch_size):
+                k = np.random.randint(0, 5)
+                self.segmentation_mask[i:i+self.batch_size] = np.rot90(self.segmentation_mask[i:i+self.batch_size], k = k, axes=(1, 2))
+                self.real_image[i:i+self.batch_size] = np.rot90(self.real_image[i:i+self.batch_size], k = k, axes=(1, 2))
+        if self.mirroring:
+            for i in range(0, len(self.segmentation_mask), self.batch_size):
+                self.segmentation_mask[i:i+self.batch_size] = np.flip(self.segmentation_mask[i:i+self.batch_size], axis=2)
+                self.real_image[i:i+self.batch_size] = np.flip(self.real_image[i:i+self.batch_size], axis=2)
     def get_number_of_classes(self):
         return self.classes
 
 
 def load_and_resize(path: str, size: Tuple[int, int]) -> np.ndarray:
     im = io.imread(path)
-    im = transform.resize(im, size, preserve_range=True).astype(np.uint8)
+    im = cv2.resize(im, size).astype(np.uint8)
     return im
 
 
@@ -220,28 +236,23 @@ if __name__ == '__main__':
             images = np.concatenate(images, axis=0)
         np.save('data/lhq_256/images_128.npy', images)
 
+
     if False:
-        feature_extractor = SegformerFeatureExtractor.from_pretrained(
-            "nvidia/segformer-b0-finetuned-ade-512-512")
-        model = SegformerForSemanticSegmentation.from_pretrained(
-            "nvidia/segformer-b0-finetuned-ade-512-512")
-        dataset = load_dataset(
-            'data/lhq_256/24_classes.npy', 'data/lhq_256/images.npy')
+        d256 = np.load('data/lhq_256/images.npy')
+        data= []
+        for i in tqdm(range(len(d256))):
+            im128from256 = cv2.resize(d256[i], (128, 128), interpolation = cv2.INTER_NEAREST)
+            data.append(im128from256)
+        np.save('data/lhq_256/images_128.npy', data)
+        
+    if True:
+        classes = 24
+        d256 = np.load('data/ADE20K/24_classes.npy')
+        data = np.zeros((*d256.shape[:3], 3), dtype=np.uint8)
+        vals = generate_colors(classes)
+        for i in tqdm(range(len(d256))):
+            for c in range(1, classes + 1):
+                data[i][d256[i, ..., 0] == c] = vals[c - 1]
+            
+        np.save('data/ADE20K/24_classes_rbg.npy', data)
 
-        images = dataset[1][:10]
-        masks128x128 = image_to_mask(images, model, feature_extractor)
-
-        masks = []
-        for k in range(len(masks128x128)):
-            mask = transform.resize(
-                masks128x128[k], images[k].shape, preserve_range=True).astype(np.uint8)
-            masks.append(mask)
-
-        print(parse_csv())
-        for i in range(10):
-            plt.imshow(dataset[0][i])
-            plt.show()
-            plt.imshow(masks[i])
-            plt.show()
-            plt.imshow(dataset[1][i])
-            plt.show()

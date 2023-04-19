@@ -3,14 +3,16 @@ Double Discriminator GAN architecture
 @author: Adrian Kucharski
 """
 import datetime
+import math
 import os
 from pathlib import Path
 from typing import List, NamedTuple, Tuple, Union
 import inspect
 import numpy as np
+from pyparsing import str_type
 import tensorflow as tf
 from skimage import io
-from keras import Model, Sequential
+from keras import Model, Sequential, initializers
 from keras.layers import (
     BatchNormalization,
     GaussianDropout,
@@ -20,6 +22,7 @@ from keras.layers import (
     Dropout,
     Input,
     LeakyReLU,
+    ReLU,
     MaxPooling2D,
     Conv2DTranspose,
     Dense,
@@ -28,7 +31,7 @@ from keras.layers import (
     Reshape,
     Layer
 )
-from keras.losses import BinaryCrossentropy, MeanAbsoluteError
+from keras.losses import BinaryCrossentropy, MeanAbsoluteError, Hinge
 from keras.optimizers import Adam, RMSprop
 from keras.callbacks import TensorBoard, LambdaCallback, ModelCheckpoint
 from tqdm import tqdm
@@ -39,7 +42,6 @@ import pytictoc
 tic_timer = pytictoc.TicToc()
 np.set_printoptions(suppress=True)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
 
 
 class Noise(Layer):
@@ -66,24 +68,26 @@ class GAN_Model:
     ):
         self.input_size = input_size
         self.output_size = output_size
+        self.ini = initializers.initializers_v2.GlorotNormal()
+        self.ini2 = initializers.initializers_v2.GlorotUniform()
         self.g_model = self._generator_model()
         self.d_model_patch = self._discriminator_patch_model()
         self.d_model_global = self._discriminator_global_model()
         self.gan_loss_weights = K.variable(gan_loss_weights)
 
-        d_loss = BinaryCrossentropy(from_logits=True)
+        d_loss = BinaryCrossentropy()
         g_loss = MeanAbsoluteError()
-
+        
         # Generator won't be trained directly
         # Just compile it
         self.g_model.compile()
         self.d_model_patch.compile(
-            optimizer=Adam(d_p_lr, beta_1=0.5),
+            optimizer=Adam(d_p_lr, beta_1=0.0),
             loss=d_loss,
             metrics=["accuracy"]
         )
         self.d_model_global.compile(
-            optimizer=Adam(d_g_lr, beta_1=0.5),
+            optimizer=Adam(d_g_lr, beta_1=0.0),
             loss=d_loss,
             metrics=["accuracy"]
         )
@@ -95,7 +99,7 @@ class GAN_Model:
         # Define GAN model
         self.gan = self._gan_model()
         self.gan.compile(
-            optimizer=Adam(gan_lr, beta_1=0.5),
+            optimizer=Adam(gan_lr, beta_1=0.0),
             loss=[d_loss, d_loss, g_loss],
             loss_weights=self.gan_loss_weights
         )
@@ -110,86 +114,87 @@ class GAN_Model:
     def _discriminator_patch_model(self):
         h = Input(self.input_size, name="mask")
         t = Input(self.output_size, name="image")
-        kernels = 3
+        kernels = 4
+        rate = 0.2
 
         inputs = Concatenate()([h, t])
-        x = Conv2D(64, kernels, padding="same", use_bias=False)(inputs)
-        x = LeakyReLU(0.3)(x)
-
-        x = MaxPooling2D((2, 2))(x)
+        x = Conv2D(64, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(inputs)
+        x = LeakyReLU(rate)(x)
         x = Dropout(0.5)(x)
-        x = Conv2D(128, kernels, padding="same", use_bias=False)(x)
-        x = LeakyReLU(0.3)(BatchNormalization()(x))
 
-        x = MaxPooling2D((2, 2))(x)
+        x = Conv2D(128, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(x)
+        x = LeakyReLU(rate)(x)
         x = Dropout(0.5)(x)
-        x = Conv2D(256, kernels, padding="same", use_bias=False)(x)
-        x = LeakyReLU(0.3)(BatchNormalization()(x))
 
-        x = Conv2D(1, kernels, padding="same", use_bias=False)(x)
+        x = Conv2D(256, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(x)
+        x = LeakyReLU(rate)(x)
+        x = Dropout(0.5)(x)
+
+        # x = MaxPooling2D((2, 2))(x)
+        # x = Dropout(0.5)(x)
+        # x = Conv2D(512, kernels, padding="valid", use_bias=False, kernel_initializer=self.ini)(x)
+        # x = LeakyReLU(0.3)(x)
+
+        x = Conv2D(1, kernels, activation='sigmoid', padding="valid", use_bias=False)(x)
         return Model(inputs=[h, t], outputs=x, name="discriminator_patch")
 
     def _discriminator_global_model(self):
         h = Input(self.input_size, name="mask")
         t = Input(self.output_size, name="image")
-        kernels = 3
+        kernels = 4
+        rate = 0.2
 
         inputs = Concatenate()([h, t])
-        x = Conv2D(64, kernels, padding="same", use_bias=False)(inputs)
-        x = LeakyReLU(0.3)(x)
-
-        x = MaxPooling2D((2, 2))(x)
+        x = Conv2D(64, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(inputs)
+        x = LeakyReLU(rate)(x)
         x = Dropout(0.5)(x)
-        x = Conv2D(128, kernels, padding="same", use_bias=False)(x)
-        x = LeakyReLU(0.3)(BatchNormalization()(x))
 
-        x = MaxPooling2D((2, 2))(x)
+        x = Conv2D(128, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(x)
+        x = LeakyReLU(rate)(x)
         x = Dropout(0.5)(x)
-        x = Conv2D(256, kernels, padding="same", use_bias=False)(x)
-        x = LeakyReLU(0.3)(BatchNormalization()(x))
+
+        
+        x = Conv2D(256, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(x)
+        x = LeakyReLU(rate)(x)
+        x = Dropout(0.5)(x)
 
         x = Flatten()(x)
-        x = Dense(128, activation='relu', use_bias=False)(x)
-        x = Dense(1, use_bias=False)(x)
+        x = Dense(128, activation=LeakyReLU(rate),
+                  use_bias=False, kernel_initializer=self.ini)(x)
+        x = Dense(1, activation='sigmoid', use_bias=False)(x)
         return Model(inputs=[h, t], outputs=x, name="discriminator_global")
 
     def _generator_model(self):
+        kernels = 4
+        depth = 6
+        nc = 256
+        fl = 64
+        sd = self.input_size[0] // 2 ** depth
+        
         H = h = Input(self.input_size, name="mask")
         z = Noise((256,))(h)
-        x = h  # Concatenate()([h, z])
+        n = Dense(sd * sd * nc)(z)
+        x = Reshape((sd, sd, nc))(n)
 
-        encoder = []
-        kernels = 4
-        noise_channels = 1
-        filters, fn, fm = np.array([32, 64, 128, 256]), 256, 32
-        for f in filters:
-            x = Conv2D(f, kernels, padding="same", activation="relu")(x)
-            encoder.append(x)
-            x = Conv2D(f, kernels, strides=2, padding="same",
-                       activation=LeakyReLU(0.1))(x)
-
-            n = Dense(np.prod(x.shape[1:3]) * noise_channels,
-                      activation=LeakyReLU(0.1))(z)
-            n = Reshape((*x.shape[1:3], noise_channels))(n)
-            x = Concatenate()([x, n])
-
-        x = Conv2D(fn, kernels, padding="same", activation="relu")(x)
-        x = Conv2D(fn, kernels, padding="same", activation="relu")(x)
-
-        for f in filters[::-1]:
-            x = Conv2DTranspose(f, kernels, strides=2,
-                                padding='same', activation=LeakyReLU(0.1))(x)
-            x = Conv2D(f, kernels, padding="same", activation='relu')(x)
-            x = Concatenate()([encoder.pop(), x])
-
-        x = GaussianDropout(0.1)(x)
-        x = Conv2D(fm, kernels, padding="same", activation="relu")(x)
-        outputs = Conv2D(
-            self.output_size[-1], 3, padding="same", activation="tanh", name="output")(x)
-        return Model(inputs=H, outputs=outputs, name="generator")
+        for p in reversed(range(1, depth + 1)):
+            m = tf.image.resize(h, x.shape[1:3], method='nearest')
+            x = Concatenate()([x, m])
+            x = Conv2D(fl * p, kernels, padding='same', activation=LeakyReLU(0.2))(x)
+            x = UpSampling2D()(x)
+            x = Conv2D(fl * p, kernels, padding='same', activation='relu')(x)
+            
+        x = Conv2D(3, 3, padding='same', activation='tanh')(x)
+        return Model(inputs=H, outputs=x, name="generator")
 
     def set_loss_weights(self, new_value: Tuple[float, float, float]):
         K.set_value(self.gan_loss_weights, new_value)
+
 
 class GAN_Training(GAN_Model):
     def __init__(
@@ -261,8 +266,12 @@ class GAN_Training(GAN_Model):
             for i in range(len(xdata)):
                 x, y = xdata[i], ydata[i]
                 impath = os.path.join(path, f"org_{i}.png")
-                x = np.argmax(x, axis=-1, keepdims=True)
-                x = np.concatenate([x, x, x], axis=-1)
+                if x.shape[-1] > 3:
+                    x = np.argmax(x, axis=-1, keepdims=True)
+                    x = np.concatenate([x, x, x], axis=-1)
+                if x.max() > 2.0:
+                    x = x / 255.0
+
                 image = np.array(
                     np.concatenate([x, pred[i], (y + 1) / 2.0],
                                    axis=1) * 255, "uint8"
@@ -361,7 +370,8 @@ class GAN_Training(GAN_Model):
         batch_size=16,
         save_per_epochs=5,
         log_per_steps=5,
-        categorical_input: bool = True
+        categorical_input: bool = True,
+        random_rot90: bool = False
     ):
         # Prepare label arrays for D and GAN training
         (
@@ -372,7 +382,8 @@ class GAN_Training(GAN_Model):
 
         # Init iterator
         data_it = DataIterator(dataset, batch_size,
-                               as_categorical=categorical_input)
+                               as_categorical=categorical_input,
+                               random_rot90=random_rot90)
         steps = len(data_it)
         assert steps > log_per_steps
         step_number = 0
@@ -398,10 +409,6 @@ class GAN_Training(GAN_Model):
                 # Train generator via discriminator
                 metrics_gan = self.gan.train_on_batch(
                     gts, [real_labels_patch, real_labels_global, images_real])
-
-                # Calculate MAE loss weight:
-                mae_weight = metrics_gan[-1] / max(metrics_d_global[0] + metrics_d_patch[0], 1)
-                self.set_loss_weights([1, 1, mae_weight])
 
                 # Store metrics in array
                 mdp.append(metrics_d_patch)
