@@ -75,6 +75,7 @@ class ResBlock(Layer):
         self.spade_2 = SPADE(self.filters)
         self.conv_1 = Conv2D(self.filters, 3, padding="same")
         self.conv_2 = Conv2D(self.filters, 3, padding="same")
+        self.leaky_relu = LeakyReLU(0.2)
         self.learned_skip = False
 
         if self.filters != input_filter:
@@ -84,12 +85,11 @@ class ResBlock(Layer):
 
     def call(self, input_tensor, mask):
         x = self.spade_1(input_tensor, mask)
-        x = self.conv_1(tf.nn.leaky_relu(x, 0.2))
+        x = self.conv_1(self.leaky_relu(x))
         x = self.spade_2(x, mask)
-        x = self.conv_2(tf.nn.leaky_relu(x, 0.2))
+        x = self.conv_2(self.leaky_relu(x))
         skip = (
-            self.conv_3(tf.nn.leaky_relu(
-                self.spade_3(input_tensor, mask), 0.2))
+            self.conv_3(self.leaky_relu(self.spade_3(input_tensor, mask)))
             if self.learned_skip
             else input_tensor
         )
@@ -120,8 +120,8 @@ class GaussianSampler(Layer):
 class FeatureMatchingLoss(Loss):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.mae = keras.losses.MeanAbsoluteError()
-
+        self.mae = MeanAbsoluteError()
+        
     def call(self, y_true, y_pred):
         loss = 0
         for i in range(len(y_true) - 1):
@@ -145,7 +145,7 @@ class VGGFeatureMatchingLoss(Loss):
         self.vgg_model = Model(vgg.input, layer_outputs, name="VGG")
         self.mae = MeanAbsoluteError()
 
-    def call(self, y_true, y_pred):
+    def call(self, y_true: tf.Tensor, y_pred: tf.Tensor):
         y_true = applications.vgg19.preprocess_input(
             127.5 * (y_true + 1))
         y_pred = applications.vgg19.preprocess_input(
@@ -164,7 +164,7 @@ class DiscriminatorLoss(Loss):
         super().__init__(**kwargs)
         self.hinge_loss = Hinge()
 
-    def call(self, y, is_real: bool):
+    def call(self, y: tf.Tensor, is_real: bool):
         label = 1.0 if is_real else -1.0
         return self.hinge_loss(label, y)
 
@@ -261,7 +261,7 @@ class DDGauGAN:
         x = ResBlock(filters=dim // 8)(x, mask)
         x = UpSampling2D((2, 2))(x)
         x = LeakyReLU(0.2)(x)
-        x = Conv2D(self.image_shape[-1], 4, padding="same", activation='tanh')(x)
+        x = Conv2D(self.image_shape[-1], 5, padding="same", activation='tanh')(x)
         return Model([latent, mask], x, name="generator")
 
     def _build_patch_discriminator(self):
@@ -502,30 +502,32 @@ class Trainer(DDGauGAN):
         self.discriminator_p.trainable = False
         self.discriminator_g.trainable = False
         with tf.GradientTape() as tape:
-            # Get network outputs
+            # Get networks outputs
             real_d_p_output = self.discriminator_p([segmentation_map, image])
             real_d_g_output = self.discriminator_g([segmentation_map, image])
             fake_d_p_output, fake_d_g_output, fake_image = self.gan(
                 [latent_vector, labels, segmentation_map]
             )
 
-            # Compute D losses
+            # Compute Patch D losses
             g_loss_d_p = generator_loss(fake_d_p_output[-1])
-            g_loss_d_g = generator_loss(fake_d_g_output[-1])
             feature_loss_p = self.feature_loss_coeff * self.feature_matching_loss(
                 real_d_p_output, fake_d_p_output
             )
-            feature_loss_g = self.feature_loss_coeff * self.feature_matching_loss(
-                real_d_g_output, fake_d_g_output
-            )
+
+            # Compute Global D losses conditionaly
+            g_loss_d_g = feature_loss_g = 0
+            if self.double_disc:
+                g_loss_d_g = generator_loss(fake_d_g_output[-1])
+                feature_loss_g = self.feature_loss_coeff * self.feature_matching_loss(
+                    real_d_g_output, fake_d_g_output
+                )
 
             # Compute G losses
             kl_loss = self.kl_divergence_loss_coeff * kl_divergence_loss(mean, variance)
             vgg_loss = self.vgg_feature_loss_coeff * self.vgg_loss(image, fake_image)
 
-            if not self.double_disc:
-                g_loss_d_g = feature_loss_g = 0
-            
+            # Sum all losses into one
             total_loss = g_loss_d_g + g_loss_d_p + kl_loss + vgg_loss + feature_loss_p + feature_loss_g
 
         all_trainable_variables = (
@@ -536,7 +538,7 @@ class Trainer(DDGauGAN):
         self.generator_optimizer.apply_gradients(
             zip(gradients, all_trainable_variables)
         )
-        return total_loss, feature_loss_p, vgg_loss, kl_loss
+        return total_loss, feature_loss_p, feature_loss_g, vgg_loss, kl_loss
 
     def train_step(self, data):
         segmentation_map, image, labels = data
@@ -545,10 +547,10 @@ class Trainer(DDGauGAN):
         d_p_loss, d_g_loss = self._train_discriminators(
             latent_vector, segmentation_map, image, labels
         )
-        (generator_loss, feature_loss, vgg_loss, kl_loss) = self._train_generator(
+        (generator_loss, feature_loss_p, feature_loss_g, vgg_loss, kl_loss) = self._train_generator(
             latent_vector, segmentation_map, labels, image, mean, variance
         )
-        return generator_loss, feature_loss, vgg_loss, kl_loss, d_p_loss, d_g_loss
+        return generator_loss, feature_loss_p, feature_loss_g, vgg_loss, kl_loss, d_p_loss, d_g_loss
 
     def train(
         self,
@@ -569,8 +571,7 @@ class Trainer(DDGauGAN):
         assert steps > log_per_steps
         step_number = 0
 
-        names = ["generator_loss", "feature_loss",
-                 "vgg_loss", "kl_loss", "d_p_loss", "d_g_loss"]
+        names = ["generator_loss", "feature_loss_p", "feature_loss_g", "vgg_loss", "kl_loss", "d_p_loss", "d_g_loss"]
 
         for epoch in range(epochs):
             print(f'Epoch: {epoch + 1}/{epochs}')
@@ -609,18 +610,18 @@ if __name__ == '__main__':
     # dataset = load_dataset('data/ADE20K/24_classes.npy', 'data/ADE20K/images.npy')
     # dataset = load_dataset('data/lhq_256/24_classes_rgb.npy', 'data/lhq_256/images.npy')
 
-    dataset_part = 0.5
-    maps = np.load('data/lhq_256/24_classes_rgb.npy')
+    dataset_part = 1
+    maps = np.load('data/ADE20K/24_classes_rgb.npy')
     maps1 = maps[:int(len(maps) * dataset_part)]
     maps = None
     del maps
     
-    imgs = np.load('data/lhq_256/images.npy')
+    imgs = np.load('data/ADE20K/images.npy')
     imgs1 = imgs[:int(len(imgs) * dataset_part)]
     imgs = None
     del imgs
     
-    labels = np.load('data/lhq_256/24_classes.npy')
+    labels = np.load('data/ADE20K/24_classes.npy')
     labels1 = labels[:int(len(labels) * dataset_part)]
     labels = None
     del labels
