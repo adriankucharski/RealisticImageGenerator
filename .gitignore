@@ -3,3 +3,4 @@ data/
 temp.*
 /logs/
 /__pycache__/
+/checkpoints

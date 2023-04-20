@@ -3,37 +3,28 @@ Double Discriminator GAN architecture
 @author: Adrian Kucharski
 """
 import datetime
-import math
 import os
 from pathlib import Path
-from typing import List, NamedTuple, Tuple, Union
+from typing import List, Tuple, Union
 import inspect
 import numpy as np
-from pyparsing import str_type
 import tensorflow as tf
 from skimage import io
-from keras import Model, Sequential, initializers
+from keras import Model, initializers
 from keras.layers import (
-    BatchNormalization,
-    GaussianDropout,
     Concatenate,
     Conv2D,
     UpSampling2D,
     Dropout,
     Input,
     LeakyReLU,
-    ReLU,
-    MaxPooling2D,
-    Conv2DTranspose,
     Dense,
     Flatten,
-    Activation,
     Reshape,
     Layer
 )
-from keras.losses import BinaryCrossentropy, MeanAbsoluteError, Hinge
-from keras.optimizers import Adam, RMSprop
-from keras.callbacks import TensorBoard, LambdaCallback, ModelCheckpoint
+from keras.losses import MeanAbsoluteError, Hinge
+from keras.optimizers import Adam
 from tqdm import tqdm
 from dataset import DataIterator
 import keras.backend as K
@@ -56,6 +47,76 @@ class Noise(Layer):
         return {"size": self.size}
 
 
+class SPADE(Layer):
+    def __init__(self, filters, epsilon=1e-5, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+        self.conv = Conv2D(128, 3, padding="same", activation="relu")
+        self.conv_gamma = Conv2D(filters, 3, padding="same")
+        self.conv_beta = Conv2D(filters, 3, padding="same")
+
+    def build(self, input_shape):
+        self.resize_shape = input_shape[1:3]
+
+    def call(self, input_tensor, raw_mask):
+        mask = tf.image.resize(raw_mask, self.resize_shape, method="nearest")
+        x = self.conv(mask)
+        gamma = self.conv_gamma(x)
+        beta = self.conv_beta(x)
+
+        mean, var = tf.nn.moments(input_tensor, axes=(0, 1, 2), keepdims=True)
+        std = tf.sqrt(var + self.epsilon)
+        normalized = (input_tensor - mean) / std
+
+        output = gamma * normalized + beta
+        return output
+
+    def get_config(self):
+        return {
+            "epsilon": self.epsilon,
+            "conv": self.conv,
+            "conv_gamma": self.conv_gamma,
+            "conv_beta": self.conv_beta
+        }
+
+class ResBlock(Layer):
+    def __init__(self, filters, **kwargs):
+        super().__init__(**kwargs)
+        self.filters = filters
+
+    def build(self, input_shape):
+        input_filter = input_shape[-1]
+        self.spade_1 = SPADE(input_filter)
+        self.spade_2 = SPADE(self.filters)
+        self.conv_1 = Conv2D(self.filters, 3, padding="same")
+        self.conv_2 = Conv2D(self.filters, 3, padding="same")
+        self.learned_skip = False
+
+        if self.filters != input_filter:
+            self.learned_skip = True
+            self.spade_3 = SPADE(input_filter)
+            self.conv_3 = Conv2D(self.filters, 3, padding="same")
+
+    def call(self, input_tensor, mask):
+        x = self.spade_1(input_tensor, mask)
+        x = self.conv_1(tf.nn.leaky_relu(x, 0.2))
+        x = self.spade_2(x, mask)
+        x = self.conv_2(tf.nn.leaky_relu(x, 0.2))
+
+        skip = (
+            self.conv_3(tf.nn.leaky_relu(self.spade_3(input_tensor, mask), 0.2))
+            if self.learned_skip
+            else input_tensor
+        )
+
+        output = skip + x
+        return output
+
+    def get_config(self):
+        return {
+            "filters": self.filters,
+        }
+        
 class GAN_Model:
     def __init__(
         self,
@@ -75,21 +136,19 @@ class GAN_Model:
         self.d_model_global = self._discriminator_global_model()
         self.gan_loss_weights = K.variable(gan_loss_weights)
 
-        d_loss = BinaryCrossentropy()
+        d_loss = Hinge()
         g_loss = MeanAbsoluteError()
         
         # Generator won't be trained directly
         # Just compile it
         self.g_model.compile()
         self.d_model_patch.compile(
-            optimizer=Adam(d_p_lr, beta_1=0.0),
-            loss=d_loss,
-            metrics=["accuracy"]
+            optimizer=Adam(d_p_lr, beta_1=0.5),
+            loss=d_loss
         )
         self.d_model_global.compile(
-            optimizer=Adam(d_g_lr, beta_1=0.0),
-            loss=d_loss,
-            metrics=["accuracy"]
+            optimizer=Adam(d_g_lr, beta_1=0.5),
+            loss=d_loss
         )
 
         # Disable a discriminator training during gan training
@@ -99,7 +158,7 @@ class GAN_Model:
         # Define GAN model
         self.gan = self._gan_model()
         self.gan.compile(
-            optimizer=Adam(gan_lr, beta_1=0.0),
+            optimizer=Adam(gan_lr, beta_1=0.5),
             loss=[d_loss, d_loss, g_loss],
             loss_weights=self.gan_loss_weights
         )
@@ -138,7 +197,7 @@ class GAN_Model:
         # x = Conv2D(512, kernels, padding="valid", use_bias=False, kernel_initializer=self.ini)(x)
         # x = LeakyReLU(0.3)(x)
 
-        x = Conv2D(1, kernels, activation='sigmoid', padding="valid", use_bias=False)(x)
+        x = Conv2D(1, kernels, activation='tanh', padding="valid", use_bias=False)(x)
         return Model(inputs=[h, t], outputs=x, name="discriminator_patch")
 
     def _discriminator_global_model(self):
@@ -167,30 +226,31 @@ class GAN_Model:
         x = Flatten()(x)
         x = Dense(128, activation=LeakyReLU(rate),
                   use_bias=False, kernel_initializer=self.ini)(x)
-        x = Dense(1, activation='sigmoid', use_bias=False)(x)
+        x = Dense(1, activation='tanh', use_bias=False)(x)
         return Model(inputs=[h, t], outputs=x, name="discriminator_global")
 
     def _generator_model(self):
-        kernels = 4
-        depth = 6
-        nc = 256
-        fl = 64
-        sd = self.input_size[0] // 2 ** depth
-        
-        H = h = Input(self.input_size, name="mask")
-        z = Noise((256,))(h)
-        n = Dense(sd * sd * nc)(z)
-        x = Reshape((sd, sd, nc))(n)
+        mask = Input(shape=self.input_size)
+        latent = Noise((256,))(mask)
 
-        for p in reversed(range(1, depth + 1)):
-            m = tf.image.resize(h, x.shape[1:3], method='nearest')
-            x = Concatenate()([x, m])
-            x = Conv2D(fl * p, kernels, padding='same', activation=LeakyReLU(0.2))(x)
-            x = UpSampling2D()(x)
-            x = Conv2D(fl * p, kernels, padding='same', activation='relu')(x)
-            
-        x = Conv2D(3, 3, padding='same', activation='tanh')(x)
-        return Model(inputs=H, outputs=x, name="generator")
+        x = Dense(8192)(latent)
+        x = Reshape((4, 4, 512))(x)
+        x = ResBlock(filters=512)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=512)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=512)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=256)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=128)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=64)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = tf.nn.leaky_relu(x, 0.2)
+
+        output_image = Conv2D(3, 4, padding="same", activation='tanh')(x)
+        return Model(mask, output_image, name="generator")
 
     def set_loss_weights(self, new_value: Tuple[float, float, float]):
         K.set_value(self.gan_loss_weights, new_value)
@@ -281,13 +341,6 @@ class GAN_Training(GAN_Model):
             return np.array(images, dtype="uint8")
         return None
 
-    def load_models(self, g_path: str = None, d_path: str = None):
-        if g_path:
-            self.g_model.load_weights(g_path)
-        if d_path:
-            self.d_model_patch.load_weights(d_path)
-        return self
-
     def _save_models(self, g_path: str = None, d_path: str = None):
         if self.logging:
             if g_path and self.g_path_save:
@@ -349,8 +402,8 @@ class GAN_Training(GAN_Model):
 
         real_labels_patch = tf.ones(patch_shape, dtype=tf.float32)
         real_labels_global = tf.ones(global_shape, dtype=tf.float32)
-        fake_labels_patch = tf.zeros(patch_shape, dtype=tf.float32)
-        fake_labels_global = tf.zeros(global_shape, dtype=tf.float32)
+        fake_labels_patch = -tf.ones(patch_shape, dtype=tf.float32)
+        fake_labels_global = -tf.ones(global_shape, dtype=tf.float32)
 
         labels_join_patch = tf.concat(
             [real_labels_patch, fake_labels_patch], axis=0)

@@ -110,18 +110,16 @@ def load_dataset(masks_path: str, images_path: str, classes_path: str = None) ->
 class DataIterator(keras.utils.Sequence):
     def __init__(
         self,
-        dataset: Tuple[np.ndarray, np.ndarray],
+        dataset: Tuple[np.ndarray, np.ndarray, np.ndarray],
         batch_size=32,
-        as_categorical: bool = True,
         shuffle: bool = True,
         random_rot90: bool = True,
         mirroring: bool = True
     ):
         self.dataset = dataset
         self.batch_size = batch_size
-        self.segmentation_mask, self.real_image = dataset
-        self.classes = self.segmentation_mask.max() + 1
-        self.as_categorical = as_categorical
+        self.segmentation_maps, self.real_image, self.labels = dataset
+        self.classes = self.labels.max() + 1
         self.shuffle = shuffle
         self.random_rot90 = random_rot90
         self.mirroring = mirroring
@@ -135,32 +133,35 @@ class DataIterator(keras.utils.Sequence):
         "Generate one batch of data and returns: (mask, image)"
         # Generate indexes of the batch
         idx = np.s_[index * self.batch_size: (index + 1) * self.batch_size]
-        x = self.segmentation_mask[idx]
-        y = (self.real_image[idx] - 127.5) / 127.5
-        if self.as_categorical:
-            x = to_categorical(x, self.classes)
-        else:
-            x = (x / 127.5) - 1
-
-        return x, y
+        x = (self.segmentation_maps[idx].astype(np.float32) - 127.5) / 127.5
+        y = (self.real_image[idx].astype(np.float32) - 127.5) / 127.5
+        z = to_categorical(self.labels[idx], self.classes)
+        return x, y, z
 
     def on_epoch_end(self):
         if self.shuffle:
             seed = np.random.randint(100000)
             np.random.seed(seed)
-            np.random.shuffle(self.segmentation_mask)
+            np.random.shuffle(self.segmentation_maps)
             np.random.seed(seed)
             np.random.shuffle(self.real_image)
+            np.random.seed(seed)
+            np.random.shuffle(self.labels)
             np.random.seed(None)
+            
         if self.random_rot90:
-            for i in range(0, len(self.segmentation_mask), self.batch_size):
+            for i in range(0, len(self.segmentation_maps), self.batch_size):
                 k = np.random.randint(0, 5)
-                self.segmentation_mask[i:i+self.batch_size] = np.rot90(self.segmentation_mask[i:i+self.batch_size], k = k, axes=(1, 2))
+                self.segmentation_maps[i:i+self.batch_size] = np.rot90(self.segmentation_maps[i:i+self.batch_size], k = k, axes=(1, 2))
                 self.real_image[i:i+self.batch_size] = np.rot90(self.real_image[i:i+self.batch_size], k = k, axes=(1, 2))
+                self.labels[i:i+self.batch_size] = np.rot90(self.labels[i:i+self.batch_size], k = k, axes=(1, 2))
+
         if self.mirroring:
-            for i in range(0, len(self.segmentation_mask), self.batch_size):
-                self.segmentation_mask[i:i+self.batch_size] = np.flip(self.segmentation_mask[i:i+self.batch_size], axis=2)
+            for i in range(0, len(self.segmentation_maps), self.batch_size):
+                self.segmentation_maps[i:i+self.batch_size] = np.flip(self.segmentation_maps[i:i+self.batch_size], axis=2)
                 self.real_image[i:i+self.batch_size] = np.flip(self.real_image[i:i+self.batch_size], axis=2)
+                self.labels[i:i+self.batch_size] = np.flip(self.labels[i:i+self.batch_size], axis=2)
+
     def get_number_of_classes(self):
         return self.classes
 
