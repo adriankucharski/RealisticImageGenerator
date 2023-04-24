@@ -255,18 +255,19 @@ class DDGauGAN:
         x = UpSampling2D((2, 2))(x)
         x = ResBlock(filters=dim // 2)(x, mask)
         x = UpSampling2D((2, 2))(x)
-        x = GaussianDropout(0.15)(x)
+        # x = GaussianDropout(0.15)(x)
         x = ResBlock(filters=dim // 4)(x, mask)
         x = UpSampling2D((2, 2))(x)
         x = ResBlock(filters=dim // 8)(x, mask)
         x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=dim // 32)(x, mask)
         x = LeakyReLU(0.2)(x)
-        x = Conv2D(self.image_shape[-1], 5, padding="same", activation='tanh')(x)
+        x = Conv2D(self.image_shape[-1], 4, padding="same", activation='tanh')(x)
         return Model([latent, mask], x, name="generator")
 
     def _build_patch_discriminator(self):
-        downsample_factor = 32
-        filters_size = 5
+        downsample_factor = 64
+        filters_size = 4
         input_image_A = Input(
             shape=self.image_shape, name="discriminator_image_A")
         input_image_B = Input(
@@ -281,8 +282,8 @@ class DDGauGAN:
         return Model([input_image_A, input_image_B], outputs, name='patch_discriminator')
 
     def _build_global_discriminator(self):
-        downsample_factor = 32
-        filters_size = 5
+        downsample_factor = 64
+        filters_size = 4
         input_image_A = Input(
             shape=self.image_shape, name="discriminator_image_A")
         input_image_B = Input(
@@ -565,7 +566,7 @@ class Trainer(DDGauGAN):
         data_it = DataIterator(
             dataset,
             batch_size,
-            random_rot90=random_rot90
+            random_rot90=False, 
         )
         steps = len(data_it)
         assert steps > log_per_steps
@@ -610,18 +611,18 @@ if __name__ == '__main__':
     # dataset = load_dataset('data/ADE20K/24_classes.npy', 'data/ADE20K/images.npy')
     # dataset = load_dataset('data/lhq_256/24_classes_rgb.npy', 'data/lhq_256/images.npy')
 
-    dataset_part = 1
-    maps = np.load('data/ADE20K/24_classes_rgb.npy')
+    dataset_part = 20_000 / 90_000
+    maps = np.load('data/lhq_256/24_classes_rgb.npy')
     maps1 = maps[:int(len(maps) * dataset_part)]
     maps = None
     del maps
     
-    imgs = np.load('data/ADE20K/images.npy')
+    imgs = np.load('data/lhq_256/images.npy')
     imgs1 = imgs[:int(len(imgs) * dataset_part)]
     imgs = None
     del imgs
     
-    labels = np.load('data/ADE20K/24_classes.npy')
+    labels = np.load('data/lhq_256/24_classes.npy')
     labels1 = labels[:int(len(labels) * dataset_part)]
     labels = None
     del labels
@@ -656,4 +657,4 @@ if __name__ == '__main__':
 
 
     gan = Trainer(**args)
-    gan.train(15, dataset, save_per_epochs=1, batch_size=3, random_rot90=True)
+    gan.train(100, dataset, save_per_epochs=1, batch_size=2, random_rot90=True)
