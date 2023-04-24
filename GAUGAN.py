@@ -184,7 +184,7 @@ class DiscriminatorLoss(Loss):
         return self.hinge_loss(label, y)
 
 
-class DDGauGAN:
+class GauGAN:
     def __init__(self,
                  image_shape=(256, 256, 3),
                  num_classes: int = 25,
@@ -198,7 +198,6 @@ class DDGauGAN:
         self.mask_shape = (*image_shape[:2], num_classes)
 
         self.discriminator_p = self._build_patch_discriminator()
-        self.discriminator_g = self._build_global_discriminator()
         self.generator = self._build_generator()
         self.encoder = self._build_encoder()
         self.gan = self._build_combined_generator()
@@ -208,9 +207,6 @@ class DDGauGAN:
             gen_lr, beta_1=0.0, beta_2=0.999
         )
         self.discriminator_p_optimizer = optimizers.Adam(
-            disc_lr, beta_1=0.0, beta_2=0.999
-        )
-        self.discriminator_g_optimizer = optimizers.Adam(
             disc_lr, beta_1=0.0, beta_2=0.999
         )
         self.discriminator_loss = DiscriminatorLoss()
@@ -274,7 +270,6 @@ class DDGauGAN:
         x = UpSampling2D((2, 2))(x)
         x = ResBlock(filters=dim // 8)(x, mask)
         x = UpSampling2D((2, 2))(x)
-        x = ResBlock(filters=dim // 32)(x, mask)
         x = LeakyReLU(0.2)(x)
         x = Conv2D(self.image_shape[-1], 4, padding="same", activation='tanh')(x)
         return Model([latent, mask], x, name="generator")
@@ -295,40 +290,21 @@ class DDGauGAN:
         outputs = [x1, x2, x3, x4, x5]
         return Model([input_image_A, input_image_B], outputs, name='patch_discriminator')
 
-    def _build_global_discriminator(self):
-        downsample_factor = 64
-        filters_size = 4
-        input_image_A = Input(
-            shape=self.image_shape, name="discriminator_image_A")
-        input_image_B = Input(
-            shape=self.image_shape, name="discriminator_image_B")
-        x = Concatenate()([input_image_A, input_image_B])
-        x1 = self._downsample(downsample_factor, filters_size, apply_norm=False)(x)
-        x2 = self._downsample(2 * downsample_factor, filters_size)(x1)
-        x3 = self._downsample(4 * downsample_factor, filters_size)(x2)
-        x4 = self._downsample(8 * downsample_factor, filters_size)(x3)
-        x5 = Flatten()(x4)
-        x5 = Dense(1)(x5)
-        outputs = [x1, x2, x3, x4, x5]
-        return Model([input_image_A, input_image_B], outputs, name='global_discriminator')
-
     def _build_combined_generator(self):
         self.discriminator_p.trainable = False
-        self.discriminator_g.trainable = False
         mask_input = Input(shape=self.mask_shape, name="mask")
         image_input = Input(shape=self.image_shape, name="image")
         latent_input = Input(shape=(self.latent_dim), name="latent")
         g_out = self.generator([latent_input, mask_input])
         d_out_p = self.discriminator_p([image_input, g_out])
-        d_out_g = self.discriminator_g([image_input, g_out])
         return Model(
             [latent_input, mask_input, image_input],
-            [d_out_p, d_out_g, g_out],
+            [d_out_p, g_out],
             name="GAN"
         )
 
 
-class Trainer(DDGauGAN):
+class Trainer(GauGAN):
     def __init__(self,
                  image_shape=(256, 256, 3),
                  num_classes: int = 25,
@@ -373,7 +349,7 @@ class Trainer(DDGauGAN):
             self._log_code()
 
     def _log_code(self):
-        gt = inspect.getsource(DDGauGAN)
+        gt = inspect.getsource(GauGAN)
         gm = inspect.getsource(Trainer)
         with open(os.path.join(self.model_code_save, 'gan.txt'), 'w') as file:
             file.write(gt)
@@ -472,7 +448,7 @@ class Trainer(DDGauGAN):
                     Path(path).mkdir(parents=True, exist_ok=True)
 
     def _train_discriminators(self, latent_vector, segmentation_map, real_image, labels):
-        total_loss_p = total_loss_g = 0
+        total_loss_p = 0
         fake_images = self.generator([latent_vector, labels])
         with tf.GradientTape() as gradient_tape:
             pred_fake = self.discriminator_p(
@@ -491,36 +467,16 @@ class Trainer(DDGauGAN):
             zip(gradients, self.discriminator_p.trainable_variables)
         )
 
-        if self.double_disc:
-            with tf.GradientTape() as gradient_tape:
-                pred_fake = self.discriminator_g(
-                    [segmentation_map, fake_images])[-1]
-                pred_real = self.discriminator_g(
-                    [segmentation_map, real_image])[-1]
-                loss_fake = self.discriminator_loss(pred_fake, False)
-                loss_real = self.discriminator_loss(pred_real, True)
-                total_loss_g = 0.5 * (loss_fake + loss_real)
-
-            self.discriminator_g.trainable = True
-            gradients = gradient_tape.gradient(
-                total_loss_g, self.discriminator_g.trainable_variables
-            )
-            self.discriminator_g_optimizer.apply_gradients(
-                zip(gradients, self.discriminator_g.trainable_variables)
-            )
-
-        return total_loss_p, total_loss_g
+        return total_loss_p
 
     def _train_generator(
         self, latent_vector, segmentation_map, labels, image, mean, variance
     ):
         self.discriminator_p.trainable = False
-        self.discriminator_g.trainable = False
         with tf.GradientTape() as tape:
             # Get networks outputs
             real_d_p_output = self.discriminator_p([segmentation_map, image])
-            real_d_g_output = self.discriminator_g([segmentation_map, image])
-            fake_d_p_output, fake_d_g_output, fake_image = self.gan(
+            fake_d_p_output, fake_image = self.gan(
                 [latent_vector, labels, segmentation_map]
             )
 
@@ -530,20 +486,12 @@ class Trainer(DDGauGAN):
                 real_d_p_output, fake_d_p_output
             )
 
-            # Compute Global D losses conditionaly
-            g_loss_d_g = feature_loss_g = 0
-            if self.double_disc:
-                g_loss_d_g = generator_loss(fake_d_g_output[-1])
-                feature_loss_g = self.feature_loss_coeff * self.feature_matching_loss(
-                    real_d_g_output, fake_d_g_output
-                )
-
             # Compute G losses
             kl_loss = self.kl_divergence_loss_coeff * kl_divergence_loss(mean, variance)
             vgg_loss = self.vgg_feature_loss_coeff * self.vgg_loss(image, fake_image)
 
             # Sum all losses into one
-            total_loss = g_loss_d_g + g_loss_d_p + kl_loss + vgg_loss + feature_loss_p + feature_loss_g
+            total_loss = g_loss_d_p + kl_loss + vgg_loss + feature_loss_p
 
         all_trainable_variables = (
             self.gan.trainable_variables + self.encoder.trainable_variables
@@ -553,19 +501,19 @@ class Trainer(DDGauGAN):
         self.generator_optimizer.apply_gradients(
             zip(gradients, all_trainable_variables)
         )
-        return total_loss, feature_loss_p, feature_loss_g, vgg_loss, kl_loss
+        return total_loss, feature_loss_p, vgg_loss, kl_loss
 
     def train_step(self, data):
         segmentation_map, image, labels = data
         mean, variance = self.encoder(image)
         latent_vector = self.sampler([mean, variance])
-        d_p_loss, d_g_loss = self._train_discriminators(
+        d_p_loss = self._train_discriminators(
             latent_vector, segmentation_map, image, labels
         )
-        (generator_loss, feature_loss_p, feature_loss_g, vgg_loss, kl_loss) = self._train_generator(
+        (generator_loss, feature_loss_p, vgg_loss, kl_loss) = self._train_generator(
             latent_vector, segmentation_map, labels, image, mean, variance
         )
-        return generator_loss, feature_loss_p, feature_loss_g, vgg_loss, kl_loss, d_p_loss, d_g_loss
+        return generator_loss, feature_loss_p, vgg_loss, kl_loss, d_p_loss
 
     def train(
         self,
@@ -574,7 +522,6 @@ class Trainer(DDGauGAN):
         batch_size=4,
         save_per_epochs=1,
         log_per_steps=5,
-        random_rot90: bool = False
     ):
         # Init iterator
         data_it = DataIterator(
@@ -586,14 +533,16 @@ class Trainer(DDGauGAN):
         assert steps > log_per_steps
         step_number = 0
 
-        names = ["generator_loss", "feature_loss_p", "feature_loss_g", "vgg_loss", "kl_loss", "d_p_loss", "d_g_loss"]
+        names = ["generator_loss", "feature_loss_p", "vgg_loss", "kl_loss", "d_p_loss"]
 
         for epoch in range(epochs):
             print(f'Epoch: {epoch + 1}/{epochs}')
             losses = []
             # Training GAN loop
-            for step, (maps, images, labels), in enumerate(tqdm(data_it)):
-                all_losses = self.train_step((maps, images, labels))
+            for step in tqdm(len(data_it)):
+                with tf.profiler.experimental.Trace('train', step_num=step):
+                    (maps, images, labels) = data_it[step]
+                    all_losses = self.train_step((maps, images, labels))
 
                 # Store losses
                 losses.append([loss.numpy() for loss in all_losses])
@@ -646,7 +595,7 @@ class Predictor():
 
 if __name__ == '__main__':
     
-    if False:
+    if True:
     # dataset = load_dataset('data/ADE20K/24_classes.npy', 'data/ADE20K/images.npy')
     # dataset = load_dataset('data/lhq_256/24_classes_rgb.npy', 'data/lhq_256/images.npy')
 
