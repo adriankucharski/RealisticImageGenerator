@@ -2,6 +2,26 @@ import datetime
 from glob import glob
 import inspect
 import os
+# ============================================
+# Optimisation Flags - Do not remove
+# ============================================
+os.environ['CUDA_CACHE_DISABLE'] = '0'
+os.environ['HOROVOD_GPU_ALLREDUCE'] = 'NCCL'
+
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ['TF_GPU_THREAD_COUNT'] = '1'
+
+os.environ['TF_USE_CUDNN_BATCHNORM_SPATIAL_PERSISTENT'] = '1'
+
+os.environ['TF_ADJUST_HUE_FUSED'] = '1'
+os.environ['TF_ADJUST_SATURATION_FUSED'] = '1'
+os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
+
+os.environ['TF_SYNC_ON_FINISH'] = '0'
+os.environ['TF_AUTOTUNE_THRESHOLD'] = '2'
+os.environ['TF_DISABLE_NVTX_RANGES'] = '1'
+
+# =================================================
 
 from pathlib import Path
 from typing import List, Tuple, Union
@@ -19,7 +39,8 @@ from skimage import io
 from tqdm import tqdm
 from keras import mixed_precision, utils
 from dataset import DataIterator
-import re 
+import re
+
 
 tf.get_logger().setLevel('ERROR')
 
@@ -136,7 +157,7 @@ class FeatureMatchingLoss(Loss):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.mae = MeanAbsoluteError()
-        
+
     def call(self, y_true, y_pred):
         loss = 0
         for i in range(len(y_true) - 1):
@@ -271,7 +292,8 @@ class GauGAN:
         x = ResBlock(filters=dim // 8)(x, mask)
         x = UpSampling2D((2, 2))(x)
         x = LeakyReLU(0.2)(x)
-        x = Conv2D(self.image_shape[-1], 4, padding="same", activation='tanh')(x)
+        x = Conv2D(self.image_shape[-1], 4,
+                   padding="same", activation='tanh')(x)
         return Model([latent, mask], x, name="generator")
 
     def _build_patch_discriminator(self):
@@ -282,7 +304,8 @@ class GauGAN:
         input_image_B = Input(
             shape=self.image_shape, name="discriminator_image_B")
         x = Concatenate()([input_image_A, input_image_B])
-        x1 = self._downsample(downsample_factor, filters_size, apply_norm=False)(x)
+        x1 = self._downsample(
+            downsample_factor, filters_size, apply_norm=False)(x)
         x2 = self._downsample(2 * downsample_factor, filters_size)(x1)
         x3 = self._downsample(4 * downsample_factor, filters_size)(x2)
         x4 = self._downsample(8 * downsample_factor, filters_size)(x3)
@@ -312,7 +335,7 @@ class Trainer(GauGAN):
                  feature_loss_coeff=10,
                  vgg_feature_loss_coeff=0.1,
                  kl_divergence_loss_coeff=0.1,
-                 double_disc = True,
+                 double_disc=True,
 
                  # Logs args
                  main_log_path: str = "logs",
@@ -487,8 +510,10 @@ class Trainer(GauGAN):
             )
 
             # Compute G losses
-            kl_loss = self.kl_divergence_loss_coeff * kl_divergence_loss(mean, variance)
-            vgg_loss = self.vgg_feature_loss_coeff * self.vgg_loss(image, fake_image)
+            kl_loss = self.kl_divergence_loss_coeff * \
+                kl_divergence_loss(mean, variance)
+            vgg_loss = self.vgg_feature_loss_coeff * \
+                self.vgg_loss(image, fake_image)
 
             # Sum all losses into one
             total_loss = g_loss_d_p + kl_loss + vgg_loss + feature_loss_p
@@ -503,6 +528,7 @@ class Trainer(GauGAN):
         )
         return total_loss, feature_loss_p, vgg_loss, kl_loss
 
+    @tf.function
     def train_step(self, data):
         segmentation_map, image, labels = data
         mean, variance = self.encoder(image)
@@ -527,22 +553,24 @@ class Trainer(GauGAN):
         data_it = DataIterator(
             dataset,
             batch_size,
-            random_rot90=False, 
+            random_rot90=False,
         )
         steps = len(data_it)
         assert steps > log_per_steps
         step_number = 0
 
-        names = ["generator_loss", "feature_loss_p", "vgg_loss", "kl_loss", "d_p_loss"]
-
+        names = ["generator_loss", "feature_loss_p",
+                 "vgg_loss", "kl_loss", "d_p_loss"]
+        
         for epoch in range(epochs):
             print(f'Epoch: {epoch + 1}/{epochs}')
             losses = []
             # Training GAN loop
-            for step in tqdm(len(data_it)):
-                with tf.profiler.experimental.Trace('train', step_num=step):
-                    (maps, images, labels) = data_it[step]
-                    all_losses = self.train_step((maps, images, labels))
+            # tf.profiler.experimental.start(self.main_log_path)
+            for step in tqdm(range(len(data_it))):
+                # with tf.profiler.experimental.Trace('train', step_num=step):
+                (maps, images, labels) = data_it[step]
+                all_losses = self.train_step((maps, images, labels))
 
                 # Store losses
                 losses.append([loss.numpy() for loss in all_losses])
@@ -556,7 +584,7 @@ class Trainer(GauGAN):
                 if step % log_per_steps == log_per_steps - 1:
                     tf.summary.experimental.set_step(epoch * steps + step)
                     self._write_log(names, all_losses)
-
+            # tf.profiler.experimental.stop()
             # Call on epoch end on the dataset
             data_it.on_epoch_end()
 
@@ -569,12 +597,14 @@ class Trainer(GauGAN):
             for name, loss in zip(names, np.mean(losses, axis=0)):
                 print(f'Loss: {name}\t =', loss)
 
+
 class Predictor():
     def __init__(self, model_g_path: str) -> None:
         custom_objects = {
             'ResBlock': ResBlock,
         }
-        generator: Model = keras.models.load_model(model_g_path, custom_objects=custom_objects)
+        generator: Model = keras.models.load_model(
+            model_g_path, custom_objects=custom_objects)
         inp = Input(generator.input_shape[1][1:])
         z = Noise(generator.input_shape[0][1:])(inp)
         out = generator([z, inp])
@@ -590,31 +620,30 @@ class Predictor():
 
     def predict_on_batch(self, imgs: np.ndarray) -> np.ndarray:
         pass
-        
-    
+
 
 if __name__ == '__main__':
-    
+
     if True:
-    # dataset = load_dataset('data/ADE20K/24_classes.npy', 'data/ADE20K/images.npy')
-    # dataset = load_dataset('data/lhq_256/24_classes_rgb.npy', 'data/lhq_256/images.npy')
+        # dataset = load_dataset('data/ADE20K/24_classes.npy', 'data/ADE20K/images.npy')
+        # dataset = load_dataset('data/lhq_256/24_classes_rgb.npy', 'data/lhq_256/images.npy')
 
         dataset_part = 20_000 / 90_000
         maps = np.load('data/lhq_256/24_classes_rgb.npy')
         maps1 = maps[:int(len(maps) * dataset_part)]
         maps = None
         del maps
-        
+
         imgs = np.load('data/lhq_256/images.npy')
         imgs1 = imgs[:int(len(imgs) * dataset_part)]
         imgs = None
         del imgs
-        
+
         labels = np.load('data/lhq_256/24_classes.npy')
         labels1 = labels[:int(len(labels) * dataset_part)]
         labels = None
         del labels
-        
+
         dataset = (
             maps1,
             imgs1,
@@ -640,14 +669,13 @@ if __name__ == '__main__':
         }
 
         print(dataset[0].dtype, dataset[1].dtype,
-            dataset[1].max(), dataset[1].min())
+              dataset[1].max(), dataset[1].min())
         print(dataset[0].shape, dataset[1].shape, dataset[2].shape)
 
-
         gan = Trainer(**args)
-        gan.train(30, dataset, save_per_epochs=1, batch_size=2, random_rot90=True)
+        gan.train(30, dataset, save_per_epochs=1, batch_size=4)
 
-    if False:        
+    if False:
         batch_size = 4
         maps = np.load('data/lhq_256/24_classes_rgb.npy')[20000:21000]
         imgs = np.load('data/lhq_256/images.npy')[20000:21000]
@@ -668,13 +696,11 @@ if __name__ == '__main__':
                 for i, j in zip(range(len(im)), range(k, k + batch_size)):
                     io.imsave(str(dir_path / f'{j}.png'), im[i])
 
-    if True:
+    if False:
         import pytorch_fid
         true_path = 'R:/real/'
         all_paths = [f'R:/{i}/' for i in range(31)]
-            
-        fids = pytorch_fid.fid_score.calculate_fid_multiple_paths([true_path, *all_paths], 8, 'cuda', 2048, 0)
-        print(fids)
-            
 
-        
+        fids = pytorch_fid.fid_score.calculate_fid_multiple_paths(
+            [true_path, *all_paths], 8, 'cuda', 2048, 0)
+        print(fids)

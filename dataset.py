@@ -14,6 +14,18 @@ import matplotlib.pyplot as plt
 from transformers import SegformerFeatureExtractor, SegformerForSemanticSegmentation
 import requests
 import cv2
+import collections
+
+class FixSizeOrderedDict(collections.OrderedDict):
+    def __init__(self, *args, max=0, **kwargs):
+        self._max = max
+        super().__init__(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        collections.OrderedDict.__setitem__(self, key, value)
+        if self._max > 0:
+            if len(self) > self._max:
+                self.popitem(False)
 
 def generate_colors(num_of_colors: int, seed: int = 0) -> np.ndarray:
     colors = np.random.Generator(np.random.PCG64(seed)).integers(32, 255, size=(num_of_colors, 3))
@@ -114,7 +126,8 @@ class DataIterator(keras.utils.Sequence):
         batch_size=32,
         shuffle: bool = True,
         random_rot90: bool = True,
-        mirroring: bool = True
+        mirroring: bool = True,
+        cache_size: int = 128
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -123,6 +136,8 @@ class DataIterator(keras.utils.Sequence):
         self.shuffle = shuffle
         self.random_rot90 = random_rot90
         self.mirroring = mirroring
+        self.cache = {}
+        self.cache_size = cache_size
         self.on_epoch_end()
 
     def __len__(self) -> int:
@@ -130,13 +145,23 @@ class DataIterator(keras.utils.Sequence):
         return len(self.real_image) // self.batch_size
 
     def __getitem__(self, index: int) -> Tuple[np.ndarray, np.ndarray]:
-        "Generate one batch of data and returns: (mask, image)"
-        # Generate indexes of the batch
-        idx = np.s_[index * self.batch_size: (index + 1) * self.batch_size]
-        x = (self.segmentation_maps[idx].astype(np.float32) - 127.5) / 127.5
-        y = (self.real_image[idx].astype(np.float32) - 127.5) / 127.5
-        z = to_categorical(self.labels[idx], self.classes)
-        return x, y, z
+        "Generate one batch of data and returns: (masks, images, labels)"
+        # Get batch from cache
+        if index in self.cache.keys():
+            return self.cache[index]
+
+        # Clear cache
+        self.cache = {}
+
+        # Fill cache
+        for _index in range(index, min(index + self.cache_size, self.__len__())):
+            idx = np.s_[_index * self.batch_size: (_index + 1) * self.batch_size]
+            x = (self.segmentation_maps[idx].astype(np.float32) - 127.5) / 127.5
+            y = (self.real_image[idx].astype(np.float32) - 127.5) / 127.5
+            z = to_categorical(self.labels[idx], self.classes)
+            self.cache[_index] = (x, y, z)
+            
+        return self.cache[index]
 
     def on_epoch_end(self):
         if self.shuffle:
