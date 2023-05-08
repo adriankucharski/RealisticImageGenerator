@@ -25,7 +25,7 @@ def image_to_class(im: np.ndarray, classes: dict) -> np.ndarray:
     return data.reshape((*im.shape[:2], 1))
 
 if 'predictor' not in st.session_state:
-    st.session_state.predictor = Predictor('logs/20230421-1557/generators/model_30.h5')
+    st.session_state.predictor = Predictor(r'logs\20230504-2303\generators\model_36.h5')
 if 'model_sr' not in st.session_state:
     st.session_state.model_sr = generator()
     st.session_state.model_sr.load_weights('srgan_model/gan_generator.h5')
