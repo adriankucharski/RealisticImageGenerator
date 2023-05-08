@@ -5,6 +5,9 @@ from DDGAUGAN import Predictor
 from dataset import parse_csv, generate_colors
 from skimage import transform, filters
 import tensorflow as tf
+from model import resolve_single
+from model.edsr import edsr
+from model.srgan import generator
 
 tf.random.set_seed(0)
 
@@ -21,8 +24,11 @@ def image_to_class(im: np.ndarray, classes: dict) -> np.ndarray:
     data = np.argmin(data, axis=-1, keepdims=True)
     return data.reshape((*im.shape[:2], 1))
 
-
-predictor = Predictor('logs/20230421-1557/generators/model_30.h5')
+if 'predictor' not in st.session_state:
+    st.session_state.predictor = Predictor('logs/20230421-1557/generators/model_30.h5')
+if 'model_sr' not in st.session_state:
+    st.session_state.model_sr = generator()
+    st.session_state.model_sr.load_weights('srgan_model/gan_generator.h5')
 
 rgb2hex = lambda r,g,b: '#%02x%02x%02x' %(r,g,b)
 classes = parse_csv()
@@ -39,6 +45,7 @@ drawing_mode = st.sidebar.selectbox(
 stroke_width = st.sidebar.slider("Stroke width: ", 1, 50, 3)
 stroke_color = st.sidebar.selectbox("Stroke class hex: ", options=colors.values(), format_func=lambda x: swaped_colors[x])
 realtime_update = st.sidebar.checkbox("Update in realtime", True)
+super_resolution = st.sidebar.checkbox("Enable Super-Resolution", False)
 tf_seed = st.sidebar.number_input('Seed', value=0)
 
 # Create a canvas component
@@ -59,6 +66,9 @@ canvas_result = st_canvas(
 if canvas_result.image_data is not None:
     tf.random.set_seed(tf_seed.real)
     im = np.array(canvas_result.image_data)[..., :3]
-    im = predictor(image_to_class(im, colors_rgb))
-    st.image(transform.resize(im, (512, 512)))
+    im = st.session_state.predictor(image_to_class(im, colors_rgb))
+    if super_resolution:
+        im = resolve_single(st.session_state.model_sr, im)
+        im = filters.median(im)
+    st.image(np.array(im))
     
