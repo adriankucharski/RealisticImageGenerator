@@ -10,27 +10,21 @@ import inspect
 import numpy as np
 import tensorflow as tf
 from skimage import io
-from keras import Model, Sequential
+from keras import Model, initializers
 from keras.layers import (
-    BatchNormalization,
-    GaussianDropout,
     Concatenate,
     Conv2D,
     UpSampling2D,
     Dropout,
     Input,
     LeakyReLU,
-    MaxPooling2D,
-    Conv2DTranspose,
     Dense,
     Flatten,
-    Activation,
     Reshape,
     Layer
 )
-from keras.losses import BinaryCrossentropy, MeanAbsoluteError
-from keras.optimizers import Adam, RMSprop
-from keras.callbacks import TensorBoard, LambdaCallback, ModelCheckpoint
+from keras.losses import MeanAbsoluteError, Hinge
+from keras.optimizers import Adam
 from tqdm import tqdm
 from dataset import DataIterator
 import keras.backend as K
@@ -53,6 +47,76 @@ class Noise(Layer):
         return {"size": self.size}
 
 
+class SPADE(Layer):
+    def __init__(self, filters, epsilon=1e-5, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+        self.conv = Conv2D(128, 3, padding="same", activation="relu")
+        self.conv_gamma = Conv2D(filters, 3, padding="same")
+        self.conv_beta = Conv2D(filters, 3, padding="same")
+
+    def build(self, input_shape):
+        self.resize_shape = input_shape[1:3]
+
+    def call(self, input_tensor, raw_mask):
+        mask = tf.image.resize(raw_mask, self.resize_shape, method="nearest")
+        x = self.conv(mask)
+        gamma = self.conv_gamma(x)
+        beta = self.conv_beta(x)
+
+        mean, var = tf.nn.moments(input_tensor, axes=(0, 1, 2), keepdims=True)
+        std = tf.sqrt(var + self.epsilon)
+        normalized = (input_tensor - mean) / std
+
+        output = gamma * normalized + beta
+        return output
+
+    def get_config(self):
+        return {
+            "epsilon": self.epsilon,
+            "conv": self.conv,
+            "conv_gamma": self.conv_gamma,
+            "conv_beta": self.conv_beta
+        }
+
+class ResBlock(Layer):
+    def __init__(self, filters, **kwargs):
+        super().__init__(**kwargs)
+        self.filters = filters
+
+    def build(self, input_shape):
+        input_filter = input_shape[-1]
+        self.spade_1 = SPADE(input_filter)
+        self.spade_2 = SPADE(self.filters)
+        self.conv_1 = Conv2D(self.filters, 3, padding="same")
+        self.conv_2 = Conv2D(self.filters, 3, padding="same")
+        self.learned_skip = False
+
+        if self.filters != input_filter:
+            self.learned_skip = True
+            self.spade_3 = SPADE(input_filter)
+            self.conv_3 = Conv2D(self.filters, 3, padding="same")
+
+    def call(self, input_tensor, mask):
+        x = self.spade_1(input_tensor, mask)
+        x = self.conv_1(tf.nn.leaky_relu(x, 0.2))
+        x = self.spade_2(x, mask)
+        x = self.conv_2(tf.nn.leaky_relu(x, 0.2))
+
+        skip = (
+            self.conv_3(tf.nn.leaky_relu(self.spade_3(input_tensor, mask), 0.2))
+            if self.learned_skip
+            else input_tensor
+        )
+
+        output = skip + x
+        return output
+
+    def get_config(self):
+        return {
+            "filters": self.filters,
+        }
+        
 class GAN_Model:
     def __init__(
         self,
@@ -65,25 +129,26 @@ class GAN_Model:
     ):
         self.input_size = input_size
         self.output_size = output_size
+        self.ini = initializers.initializers_v2.GlorotNormal()
+        self.ini2 = initializers.initializers_v2.GlorotUniform()
         self.g_model = self._generator_model()
         self.d_model_patch = self._discriminator_patch_model()
         self.d_model_global = self._discriminator_global_model()
+        self.gan_loss_weights = K.variable(gan_loss_weights)
 
-        d_loss = BinaryCrossentropy(from_logits=True)
+        d_loss = Hinge()
         g_loss = MeanAbsoluteError()
-
+        
         # Generator won't be trained directly
         # Just compile it
         self.g_model.compile()
         self.d_model_patch.compile(
-            optimizer=Adam(d_g_lr, beta_1=0.5),
-            loss=d_loss,
-            metrics=["accuracy"]
+            optimizer=Adam(d_p_lr, beta_1=0.5),
+            loss=d_loss
         )
         self.d_model_global.compile(
             optimizer=Adam(d_g_lr, beta_1=0.5),
-            loss=d_loss,
-            metrics=["accuracy"]
+            loss=d_loss
         )
 
         # Disable a discriminator training during gan training
@@ -95,7 +160,7 @@ class GAN_Model:
         self.gan.compile(
             optimizer=Adam(gan_lr, beta_1=0.5),
             loss=[d_loss, d_loss, g_loss],
-            loss_weights=gan_loss_weights
+            loss_weights=self.gan_loss_weights
         )
 
     def _gan_model(self):
@@ -108,78 +173,87 @@ class GAN_Model:
     def _discriminator_patch_model(self):
         h = Input(self.input_size, name="mask")
         t = Input(self.output_size, name="image")
-        kernels = 3
+        kernels = 4
+        rate = 0.2
 
         inputs = Concatenate()([h, t])
-        x = Conv2D(64, kernels, padding="same", use_bias=False)(inputs)
-        x = LeakyReLU(0.3)(x)
-
-        x = MaxPooling2D((2, 2))(x)
+        x = Conv2D(64, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(inputs)
+        x = LeakyReLU(rate)(x)
         x = Dropout(0.5)(x)
-        x = Conv2D(128, kernels, padding="same", use_bias=False)(x)
-        x = LeakyReLU(0.3)(BatchNormalization()(x))
 
-        x = MaxPooling2D((2, 2))(x)
+        x = Conv2D(128, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(x)
+        x = LeakyReLU(rate)(x)
         x = Dropout(0.5)(x)
-        x = Conv2D(256, kernels, padding="same", use_bias=False)(x)
-        x = LeakyReLU(0.3)(BatchNormalization()(x))
 
-        x = Conv2D(1, kernels, padding="same", use_bias=False)(x)
+        x = Conv2D(256, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(x)
+        x = LeakyReLU(rate)(x)
+        x = Dropout(0.5)(x)
+
+        # x = MaxPooling2D((2, 2))(x)
+        # x = Dropout(0.5)(x)
+        # x = Conv2D(512, kernels, padding="valid", use_bias=False, kernel_initializer=self.ini)(x)
+        # x = LeakyReLU(0.3)(x)
+
+        x = Conv2D(1, kernels, activation='tanh', padding="valid", use_bias=False)(x)
         return Model(inputs=[h, t], outputs=x, name="discriminator_patch")
 
     def _discriminator_global_model(self):
         h = Input(self.input_size, name="mask")
         t = Input(self.output_size, name="image")
-        kernels = 3
+        kernels = 4
+        rate = 0.2
 
         inputs = Concatenate()([h, t])
-        x = Conv2D(64, kernels, padding="same", use_bias=False)(inputs)
-        x = LeakyReLU(0.3)(x)
-
-        x = MaxPooling2D((2, 2))(x)
+        x = Conv2D(64, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(inputs)
+        x = LeakyReLU(rate)(x)
         x = Dropout(0.5)(x)
-        x = Conv2D(128, kernels, padding="same", use_bias=False)(x)
-        x = LeakyReLU(0.3)(BatchNormalization()(x))
 
-        x = MaxPooling2D((2, 2))(x)
+        x = Conv2D(128, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(x)
+        x = LeakyReLU(rate)(x)
         x = Dropout(0.5)(x)
-        x = Conv2D(256, kernels, padding="same", use_bias=False)(x)
-        x = LeakyReLU(0.3)(BatchNormalization()(x))
+
+        
+        x = Conv2D(256, kernels, padding="valid", use_bias=False,
+                   strides=2, kernel_initializer=self.ini)(x)
+        x = LeakyReLU(rate)(x)
+        x = Dropout(0.5)(x)
 
         x = Flatten()(x)
-        x = Dense(128, use_bias=False)(x)
-        x = Dense(1, use_bias=False)(x)
+        x = Dense(128, activation=LeakyReLU(rate),
+                  use_bias=False, kernel_initializer=self.ini)(x)
+        x = Dense(1, activation='tanh', use_bias=False)(x)
         return Model(inputs=[h, t], outputs=x, name="discriminator_global")
 
     def _generator_model(self):
-        H = h = Input(self.input_size, name="mask")
-        z = Noise((256,))(h)
-        x = h  # Concatenate()([h, z])
+        mask = Input(shape=self.input_size)
+        latent = Noise((256,))(mask)
 
-        encoder = []
-        kernels = 4
-        filters, fn, fm = np.array([32, 64, 128, 192]), 256, 32
-        for f in filters:
-            x = Conv2D(f, kernels, padding="same", activation="relu")(x)
-            encoder.append(x)
-            x = Conv2D(f, kernels, strides=2, padding="same")(x)
+        x = Dense(8192)(latent)
+        x = Reshape((4, 4, 512))(x)
+        x = ResBlock(filters=512)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=512)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=512)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=256)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=128)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = ResBlock(filters=64)(x, mask)
+        x = UpSampling2D((2, 2))(x)
+        x = tf.nn.leaky_relu(x, 0.2)
 
-            n = Dense(np.prod(x.shape[1:3]) * f // 8)(z)
-            n = Reshape((*x.shape[1:3], f // 8))(n)
-            x = Concatenate()([x, n])
+        output_image = Conv2D(3, 4, padding="same", activation='tanh')(x)
+        return Model(mask, output_image, name="generator")
 
-        x = Conv2D(fn, kernels, padding="same", activation="relu")(x)
-
-        for f in filters[::-1]:
-            x = Conv2DTranspose(f, kernels, strides=2, padding='same')(x)
-            x = Conv2D(f, kernels, padding="same", activation='relu')(x)
-            x = Concatenate()([encoder.pop(), x])
-
-        x = GaussianDropout(0.1)(x)
-        x = Conv2D(fm, kernels, padding="same", activation="relu")(x)
-        outputs = Conv2D(self.output_size[-1], 3, padding="same",
-                         activation="tanh", name="output")(x)
-        return Model(inputs=H, outputs=outputs, name="generator")
+    def set_loss_weights(self, new_value: Tuple[float, float, float]):
+        K.set_value(self.gan_loss_weights, new_value)
 
 
 class GAN_Training(GAN_Model):
@@ -188,27 +262,26 @@ class GAN_Training(GAN_Model):
         # GAN Model args
         input_size=(256, 256, 25),
         output_size=(256, 256, 3),
-        d_p_lr=1e-5,
-        d_g_lr=1e-5,
-        gan_lr=1e-5,
-        gan_loss_weights: Tuple[float, float, float] = [1, 1, 100],
+        d_p_lr=4e-4,
+        d_g_lr=4e-4,
+        gan_lr=1e-4,
+        gan_loss_weights: Tuple[float, float, float] = [1, 1, 10],
 
         # GAN_Training args
         main_log_path: str = "logs",
         g_path_save: str = "generators",
         d_path_save: str = "discriminators",
         evaluate_path_save: str = "images",
-        log_path: str = "tf_logs",
         model_code_save: str = 'code',
         save_with_optimizer: bool = False,
         logging: bool = True,
-        evaluate_per_step: int = None
+        evaluate_per_step: int = None,
     ):
         super().__init__(input_size, output_size, d_p_lr, d_g_lr, gan_lr, gan_loss_weights)
+        self.args_to_save = inspect.getargvalues(inspect.currentframe())
 
         timer = datetime.datetime.now().strftime("%Y%m%d-%H%M")
         self.main_log_path = os.path.join(main_log_path, timer)
-        self.log_path = log_path
         self.g_path_save = g_path_save
         self.d_path_save = d_path_save
         self.evaluate_path_save = evaluate_path_save
@@ -219,17 +292,18 @@ class GAN_Training(GAN_Model):
 
         self._create_dirs()
         if self.logging:
-            self.writer = tf.summary.create_file_writer(
-                os.path.join(self.main_log_path, self.log_path))
+            self.writer = tf.summary.create_file_writer(self.main_log_path)
             self._log_code()
 
     def _log_code(self):
-        g = inspect.getsource(self._generator_model)
-        d = inspect.getsource(self._discriminator_patch_model)
+        gt = inspect.getsource(GAN_Training)
+        gm = inspect.getsource(GAN_Model)
         with open(os.path.join(self.model_code_save, 'gan.txt'), 'w') as file:
-            file.write(g)
+            file.write(gt)
             file.write('\n')
-            file.write(d)
+            file.write(gm)
+            file.write('\n')
+            file.write(str(self.args_to_save))
 
     def _evaluate(
         self,
@@ -252,8 +326,12 @@ class GAN_Training(GAN_Model):
             for i in range(len(xdata)):
                 x, y = xdata[i], ydata[i]
                 impath = os.path.join(path, f"org_{i}.png")
-                x = np.argmax(x, axis=-1, keepdims=True)
-                x = np.concatenate([x, x, x], axis=-1)
+                if x.shape[-1] > 3:
+                    x = np.argmax(x, axis=-1, keepdims=True)
+                    x = np.concatenate([x, x, x], axis=-1)
+                if x.max() > 2.0:
+                    x = x / 255.0
+
                 image = np.array(
                     np.concatenate([x, pred[i], (y + 1) / 2.0],
                                    axis=1) * 255, "uint8"
@@ -262,13 +340,6 @@ class GAN_Training(GAN_Model):
                 images.append(image)
             return np.array(images, dtype="uint8")
         return None
-
-    def load_models(self, g_path: str = None, d_path: str = None):
-        if g_path:
-            self.g_model.load_weights(g_path)
-        if d_path:
-            self.d_model_patch.load_weights(d_path)
-        return self
 
     def _save_models(self, g_path: str = None, d_path: str = None):
         if self.logging:
@@ -302,8 +373,6 @@ class GAN_Training(GAN_Model):
 
     def _create_dirs(self):
         if self.logging:
-            if self.log_path:
-                self.log_path = os.path.join(self.main_log_path, self.log_path)
             if self.g_path_save:
                 self.g_path_save = os.path.join(
                     self.main_log_path, self.g_path_save)
@@ -318,7 +387,6 @@ class GAN_Training(GAN_Model):
                     self.main_log_path, self.evaluate_path_save)
 
             for path in [
-                self.log_path,
                 self.g_path_save,
                 self.d_path_save,
                 self.evaluate_path_save,
@@ -334,8 +402,8 @@ class GAN_Training(GAN_Model):
 
         real_labels_patch = tf.ones(patch_shape, dtype=tf.float32)
         real_labels_global = tf.ones(global_shape, dtype=tf.float32)
-        fake_labels_patch = tf.zeros(patch_shape, dtype=tf.float32)
-        fake_labels_global = tf.zeros(global_shape, dtype=tf.float32)
+        fake_labels_patch = -tf.ones(patch_shape, dtype=tf.float32)
+        fake_labels_global = -tf.ones(global_shape, dtype=tf.float32)
 
         labels_join_patch = tf.concat(
             [real_labels_patch, fake_labels_patch], axis=0)
@@ -355,6 +423,8 @@ class GAN_Training(GAN_Model):
         batch_size=16,
         save_per_epochs=5,
         log_per_steps=5,
+        categorical_input: bool = True,
+        random_rot90: bool = False
     ):
         # Prepare label arrays for D and GAN training
         (
@@ -364,7 +434,9 @@ class GAN_Training(GAN_Model):
         ) = self._prepare_discriminator_labels(batch_size)
 
         # Init iterator
-        data_it = DataIterator(dataset, batch_size)
+        data_it = DataIterator(dataset, batch_size,
+                               as_categorical=categorical_input,
+                               random_rot90=random_rot90)
         steps = len(data_it)
         assert steps > log_per_steps
         step_number = 0
@@ -399,17 +471,19 @@ class GAN_Training(GAN_Model):
                 # Save evaluation
                 if self.evaluate_per_step is not None and step_number % self.evaluate_per_step == 0:
                     images = self._evaluate(epoch, data_it[0], step_number)
-                    self._write_images(epoch, images)
                 step_number += 1
 
                 # Store generator and discriminator metrics
                 if step % log_per_steps == log_per_steps - 1:
                     tf.summary.experimental.set_step(epoch * steps + step)
-                    self._write_log(self.gan.metrics_names, metrics_gan)
-                    self._write_log(
-                        self.d_model_patch.metrics_names, metrics_d_patch)
-                    self._write_log(
-                        self.d_model_global.metrics_names, metrics_d_global)
+                    gan_mn = [m + '_gan' for m in self.gan.metrics_names]
+                    dp_mn = [
+                        m + '_d_patch' for m in self.d_model_patch.metrics_names]
+                    dg_mn = [
+                        m + '_d_global' for m in self.d_model_global.metrics_names]
+                    self._write_log(gan_mn, metrics_gan)
+                    self._write_log(dp_mn, metrics_d_patch)
+                    self._write_log(dg_mn, metrics_d_global)
 
             # Call on epoch end on the dataset
             data_it.on_epoch_end()

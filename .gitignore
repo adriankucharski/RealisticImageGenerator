@@ -1,5 +1,7 @@
-/data/
+data/
 /temp/
 temp.*
 /logs/
 /__pycache__/
+/checkpoints
+__pycache__
