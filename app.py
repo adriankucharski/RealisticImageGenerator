@@ -61,6 +61,36 @@ def merge_labels(bg_labels, fg_labels):
     return labels
 
 
+# def is_valid_color(color):
+#     valid_colors = generate_colors(len(classes))
+#     for other_color in valid_colors:
+#         if np.all(np.abs(color-other_color) < 50):
+#             return True
+#     return False
+
+
+def cleanup_labels_image(image):
+    valid_colors = [tuple(color) for color in generate_colors(len(classes))]
+    valid_colors.append((0, 0, 0))
+    cleaned_image = np.array(image)
+    
+    height, width, _ = cleaned_image.shape
+    for y in range(height):
+        for x in range(width):
+            color = tuple(image[y, x])
+            if color not in valid_colors:
+                if x != 0:
+                    new_color = cleaned_image[y, x-1]
+                elif y != 0:
+                    new_color = cleaned_image[y-1, x]
+                else:
+                    new_color = np.zeros((3,), dtype=np.uint8)
+                cleaned_image[y, x] = new_color
+                
+    return cleaned_image
+            
+
+
 # -------------------persisted-variables--------------------
 if 'predictor' not in st.session_state:
     st.session_state.predictor = Predictor('trained_models/image_generator_model.h5', 'trained_models/image_encoder_model.h5')
@@ -85,7 +115,6 @@ classes = parse_csv()
 colors = {cl: rgb2hex(*co) for (cl, co) in zip(classes.keys(), generate_colors(len(classes)))}
 colors_rgb = {cl: co for (cl, co) in zip(classes.keys(), generate_colors(len(classes)))}
 swaped_colors = get_swap_dict(colors)
-
 
 # ----------------------editing-panel-----------------------
 with st.expander('Editing', expanded=True):
@@ -150,6 +179,7 @@ canvas_result = st_canvas(
 if canvas_result.image_data is not None:
     
     added_labels = np.array(canvas_result.image_data)[..., :3]
+    added_labels = cleanup_labels_image(added_labels)
     added_labels = image_to_class(added_labels, colors_rgb)
     added_labels = utils.to_categorical(added_labels, 25)
     added_labels = added_labels[np.newaxis, ...]
@@ -157,6 +187,7 @@ if canvas_result.image_data is not None:
     
     if edit_image is not None:
         merged_labels = merge_labels(st.session_state.labels, st.session_state.added_labels)
+        image = np.argmax(st.session_state.added_labels[0], axis=-1).astype(np.uint8)
         noise = st.session_state.noise if st.session_state.noise is not None else tf.random.normal((1, 256))
         image = (st.session_state.predictor.gen([noise, merged_labels]) + 1) * 127.5
         image = np.array(image, np.uint8)
