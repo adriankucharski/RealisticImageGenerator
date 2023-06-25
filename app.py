@@ -128,9 +128,8 @@ realtime_update = st.sidebar.checkbox("Update in realtime", True)
 super_resolution = st.sidebar.checkbox("Enable Super-Resolution", False)
 tf_seed = st.sidebar.number_input('Seed', value=0, disabled=edit_image is not None)
 
-
 # --------------------------canvas------------------------------
-background_image = Image.fromarray(class_to_image(st.session_state.labels, colors_rgb)) \
+background_image = Image.fromarray((class_to_image(st.session_state.labels, colors_rgb)*0.8).astype(np.uint8)) \
     if st.session_state.labels is not None else None
 canvas_result = st_canvas(
     fill_color="#000",
