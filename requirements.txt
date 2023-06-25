@@ -1,0 +1,14 @@
+tensorflow
+tensorflow_addons
+keras
+transformers
+torch
+numpy
+scipy
+tqdm
+scikit-image
+matplotlib
+opencv-python
+streamlit
+streamlit-drawable-canvas
+pytictoc
