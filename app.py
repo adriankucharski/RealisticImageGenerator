@@ -105,7 +105,7 @@ with st.expander('Editing', expanded=True):
         if st.button('Start training'):
             progress = st.progress(0)
             merged_labels = merge_labels(st.session_state.labels, st.session_state.added_labels)
-            mask = st.session_state.added_labels.argmax(axis=-1)[..., np.newaxis] == 0
+            mask = st.session_state.added_labels.argmax(axis=-1)[..., np.newaxis] > 0
             st.session_state.noise = edit.get_noise(
                 predictor=st.session_state.predictor,
                 labels=merged_labels,

@@ -5,6 +5,7 @@ import tensorflow as tf
 from keras import utils
 from keras.losses import MeanSquaredError
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from dataset import parse_csv, image_to_mask
     
@@ -19,8 +20,8 @@ def get_labels(image, nvidia_feature_extractor, nvidia_model):
     return labels
 
 
-def get_noise(predictor, labels, target, mask, train_steps, 
-              initial_noise, st_progress):
+def get_noise(predictor, labels, target, mask, train_steps, initial_noise, st_progress):
+    mask = __create_mask(mask)
     target = cv2.resize(target, dsize=(256, 256))
     
     if initial_noise is None:
@@ -50,6 +51,17 @@ def get_noise(predictor, labels, target, mask, train_steps,
             st_progress.progress((step+1) / train_steps, text='Training')
         
     return noise.numpy()
+
+
+def __create_mask(input_mask, dilate_size=3, blur_size=21):
+    struct_elem = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+    mask = input_mask[0, ..., 0].astype(np.uint8) * 255
+    mask = cv2.dilate(mask, struct_elem, iterations=1)
+    mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+    # plt.imsave('mask.png', mask, cmap='gray')
+    mask = mask[None, ..., None] / 255.0
+    mask = 1 - mask
+    return mask
 
 
 def _filter_with_median_blur(map):
