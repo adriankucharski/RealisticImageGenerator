@@ -122,6 +122,7 @@ with st.expander('Editing', expanded=True):
 
     if edit_image:
         edit_image = get_uploaded_image(edit_image)
+        edit_image = cv2.resize(edit_image, (256, 256))
         st.image(edit_image)
         
         st.session_state.labels = edit.get_labels(
