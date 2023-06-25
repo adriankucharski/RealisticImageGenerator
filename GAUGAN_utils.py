@@ -132,7 +132,7 @@ class Downsample(Layer):
                 strides=self.strides,
                 padding="same",
                 use_bias=False,
-                kernel_initializer=initializers.initializers_v2.GlorotNormal(),
+                kernel_initializer=initializers.GlorotNormal(),
             )])
         if self.apply_norm:
             self.block.add(tfa.layers.InstanceNormalization())
@@ -162,7 +162,9 @@ class FeatureMatchingLoss(Loss):
         self.coef = coef
 
     def call(self, y_true, y_pred):
-        loss = 0
+        if self.coef == 0:
+            return 0.0
+        loss = 0.0
         for i in range(len(y_true) - 1):
             loss += self.mae(y_true[i], y_pred[i])
         return loss * self.coef
@@ -181,18 +183,51 @@ class VGGFeatureMatchingLoss(Loss):
         self.weights = [1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0]
         vgg = applications.VGG19(include_top=False, weights="imagenet")
         layer_outputs = [vgg.get_layer(x).output for x in self.encoder_layers]
-        self.vgg_model = Model(vgg.input, layer_outputs, name="VGG")
+        self.model = Model(vgg.input, layer_outputs, name="VGG")
         self.mae = MeanAbsoluteError()
         self.coef = coef
 
     def call(self, y_true: tf.Tensor, y_pred: tf.Tensor):
+        if self.coef == 0:
+            return 0
         y_true = applications.vgg19.preprocess_input(
             127.5 * (y_true + 1))
         y_pred = applications.vgg19.preprocess_input(
             127.5 * (y_pred + 1))
-        real_features = self.vgg_model(y_true)
-        fake_features = self.vgg_model(y_pred)
-        loss = 0
+        real_features = self.model(y_true)
+        fake_features = self.model(y_pred)
+        loss = 0.0
+        for i in range(len(real_features)):
+            loss += self.weights[i] * \
+                self.mae(real_features[i], fake_features[i])
+        return loss * self.coef
+    
+class InceptionV3FeatureMatchingLoss(Loss):
+    def __init__(self, coef: float = 1e-1, **kwargs):
+        super().__init__(**kwargs)
+        self.selected_layers = [
+            "conv2d_2",
+            "conv2d_3",
+            "conv2d_4",
+            "conv2d_5",
+        ]
+        self.weights = [1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0]
+        inceptionV3 = applications.Xception(include_top=False, weights="imagenet")
+        layer_outputs = [inceptionV3.get_layer(x).output for x in self.selected_layers]
+        self.model = Model(inceptionV3.input, layer_outputs, name="Xception")
+        self.mae = MeanAbsoluteError()
+        self.coef = coef
+
+    def call(self, y_true: tf.Tensor, y_pred: tf.Tensor):
+        if self.coef == 0:
+            return 0
+        y_true = applications.xception.preprocess_input(
+            127.5 * (y_true + 1))
+        y_pred = applications.xception.preprocess_input(
+            127.5 * (y_pred + 1))
+        real_features = self.model(y_true)
+        fake_features = self.model(y_pred)
+        loss = 0.0
         for i in range(len(real_features)):
             loss += self.weights[i] * \
                 self.mae(real_features[i], fake_features[i])
@@ -223,22 +258,33 @@ class KLDivergenceLoss(Loss):
         return -0.5 * tf.reduce_sum(1 + variance - tf.square(mean) - tf.exp(variance)) * self.coef
 
 class Predictor():
-    def __init__(self, model_g_path: str) -> None:
-        print(self.__class__)
+    def __init__(self, model_g_path: str, model_e_path: str = None) -> None:
         custom_objects = {
             'ResBlock': ResBlock,
+            'Downsample': Downsample,
         }
-        generator: Model = keras.models.load_model(
+        if model_e_path is not None:
+            self.encoder: Model = keras.models.load_model(model_e_path, custom_objects=custom_objects)
+            self.sampler = GaussianSampler(256)
+        self.gen: Model = keras.models.load_model(
             model_g_path, custom_objects=custom_objects)
-        inp = Input(generator.input_shape[1][1:])
-        z = Noise(generator.input_shape[0][1:])(inp)
-        out = generator([z, inp])
-        self.model = Model(inp, out)
-        self.num_classes = generator.input_shape[1][-1]
 
     def __call__(self, im: np.ndarray) -> np.ndarray:
-        x = utils.to_categorical(im, self.num_classes)
-        if len(x.shape) == 3:
-            x = x[np.newaxis]
-        x = np.array((self.model(x) + 1) * 127.5, np.uint8)
-        return x[0] if x.shape[0] == 1 else x
+        if len(im.shape) == 3:
+            im = im[np.newaxis]
+        z = tf.random.normal((im.shape[0], 256))
+        # print('shapes', z.shape, im.shape) # (1, 256) (1, 256, 256, 25)
+        tmp = self.gen.predict_on_batch([z, im])
+        # print('tmp', tmp.shape) # (1, 256, 256, 3)
+        x = np.array((tmp + 1) * 127.5, np.uint8)
+        return x
+
+    def predict_reference(self, im: np.ndarray, reference_im: np.ndarray) -> np.ndarray:
+        if len(im.shape) == 3:
+            im = im[np.newaxis]
+            reference_im = reference_im[np.newaxis]
+        mean, variance = self.encoder(reference_im)
+        z = self.sampler([mean, variance])
+        x = np.array((self.gen.predict_on_batch([z, im]) + 1) * 127.5, np.uint8)
+        return x
+    

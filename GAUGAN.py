@@ -232,7 +232,7 @@ class GauGAN:
         )
         self.discriminator_loss = DiscriminatorLoss()
         self.feature_matching_loss = FeatureMatchingLoss()
-        self.vgg_loss = VGGFeatureMatchingLoss()
+        self.perceptual_loss = VGGFeatureMatchingLoss()
 
     def _downsample(
         self,
@@ -333,7 +333,7 @@ class Trainer(GauGAN):
                  num_classes: int = 25,
                  latent_dim: int = 256,
                  feature_loss_coeff=10,
-                 vgg_feature_loss_coeff=0.1,
+                 perceptual_loss_coeff=0.1,
                  kl_divergence_loss_coeff=0.1,
                  double_disc=True,
 
@@ -351,7 +351,7 @@ class Trainer(GauGAN):
         # Loss coeffs
         self.double_disc = double_disc
         self.feature_loss_coeff = feature_loss_coeff
-        self.vgg_feature_loss_coeff = vgg_feature_loss_coeff
+        self.perceptual_loss_coeff = perceptual_loss_coeff
         self.kl_divergence_loss_coeff = kl_divergence_loss_coeff
 
         self.args_to_save = inspect.getargvalues(inspect.currentframe())
@@ -512,11 +512,11 @@ class Trainer(GauGAN):
             # Compute G losses
             kl_loss = self.kl_divergence_loss_coeff * \
                 kl_divergence_loss(mean, variance)
-            vgg_loss = self.vgg_feature_loss_coeff * \
-                self.vgg_loss(image, fake_image)
+            perceptual_loss = self.perceptual_loss_coeff * \
+                self.perceptual_loss(image, fake_image)
 
             # Sum all losses into one
-            total_loss = g_loss_d_p + kl_loss + vgg_loss + feature_loss_p
+            total_loss = g_loss_d_p + kl_loss + perceptual_loss + feature_loss_p
 
         all_trainable_variables = (
             self.gan.trainable_variables + self.encoder.trainable_variables
@@ -526,7 +526,7 @@ class Trainer(GauGAN):
         self.generator_optimizer.apply_gradients(
             zip(gradients, all_trainable_variables)
         )
-        return total_loss, feature_loss_p, vgg_loss, kl_loss
+        return total_loss, feature_loss_p, perceptual_loss, kl_loss
 
     @tf.function
     def train_step(self, data):
@@ -536,10 +536,10 @@ class Trainer(GauGAN):
         d_p_loss = self._train_discriminators(
             latent_vector, segmentation_map, image, labels
         )
-        (generator_loss, feature_loss_p, vgg_loss, kl_loss) = self._train_generator(
+        (generator_loss, feature_loss_p, perceptual_loss, kl_loss) = self._train_generator(
             latent_vector, segmentation_map, labels, image, mean, variance
         )
-        return generator_loss, feature_loss_p, vgg_loss, kl_loss, d_p_loss
+        return generator_loss, feature_loss_p, perceptual_loss, kl_loss, d_p_loss
 
     def train(
         self,
@@ -560,7 +560,7 @@ class Trainer(GauGAN):
         step_number = 0
 
         names = ["generator_loss", "feature_loss_p",
-                 "vgg_loss", "kl_loss", "d_p_loss"]
+                 "perceptual_loss", "kl_loss", "d_p_loss"]
         
         for epoch in range(epochs):
             print(f'Epoch: {epoch + 1}/{epochs}')
@@ -655,7 +655,7 @@ if __name__ == '__main__':
             "num_classes": 25,
             "latent_dim": 256,
             "feature_loss_coeff": 10,
-            "vgg_feature_loss_coeff": 0.1,
+            "perceptual_loss_coeff": 0.1,
             "kl_divergence_loss_coeff": 0.1,
 
             'main_log_path': "logs",

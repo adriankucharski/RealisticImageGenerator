@@ -5,3 +5,5 @@ temp.*
 /__pycache__/
 /checkpoints
 __pycache__
+conda/**
+trained_models/**
