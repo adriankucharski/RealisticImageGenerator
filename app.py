@@ -198,7 +198,7 @@ if canvas_result.image_data is not None:
         image = st.session_state.predictor(st.session_state.added_labels)[0]
         
     if super_resolution:
-        image = resolve_single(st.session_state.model_sr, image[0])
+        image = resolve_single(st.session_state.model_sr, image)
         image = filters.median(image)
 
     st.image(np.array(image))
